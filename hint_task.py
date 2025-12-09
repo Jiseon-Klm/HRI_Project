@@ -28,7 +28,7 @@ from google.genai import types
 
 from llm_stt_tts import STTProcessor
 from config import (
-    CAMERA_DEVICE_ID,   # 지금은 안 써도 되지만 호환용으로 남겨둠
+    CAMERA_DEVICE_ID,
     GEMINI_API_KEY,
     GEMINI_MODEL_NAME,
 )
@@ -66,8 +66,9 @@ def load_prompt_template(path: str = "prompt.txt") -> str:
 # ==========================
 def open_realsense_capture():
     """
-    1) `v4l2-ctl --list-devices`에서 'RealSense'가 들어간 디바이스 블록을 찾고
-    2) 그 블록 안의 /dev/videoX 후보들에 대해:
+    0) config.CAMERA_DEVICE_ID 가 0 이상이면: /dev/video{ID}를 우선 시도
+    1) 아니면 `v4l2-ctl --list-devices`에서 'RealSense'가 들어간 디바이스 블록을 찾고
+       그 블록 안의 /dev/videoX 후보들에 대해:
          - OpenCV(cv2.VideoCapture)로 dev를 열어서
          - 해상도 설정 후 frame을 한 번 읽어봄
        → 정상 프레임이 나오면 그 cap을 그대로 반환.
@@ -77,6 +78,35 @@ def open_realsense_capture():
     - index: /dev/videoX 의 X
     - dev_path: "/dev/videoX" 문자열
     """
+    # -----------------------------------------
+    # 0) CAMERA_DEVICE_ID가 명시된 경우 우선 시도
+    # -----------------------------------------
+    if CAMERA_DEVICE_ID is not None and CAMERA_DEVICE_ID >= 0:
+        dev = f"/dev/video{CAMERA_DEVICE_ID}"
+        print(f"[INFO] config에서 지정한 카메라 사용 시도: {dev}")
+        cap = cv2.VideoCapture(dev)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                try:
+                    print(f"[INFO] 지정된 카메라 사용 확정: {dev}, frame_shape={frame.shape}")
+                except Exception:
+                    print(f"[INFO] 지정된 카메라 사용 확정: {dev}, frame_shape=unknown")
+
+                m = re.search(r"/dev/video(\d+)", dev)
+                idx = int(m.group(1)) if m else -1
+                return cap, idx, dev
+            else:
+                print(f"[WARN] {dev} 는 열렸지만 유효한 프레임을 읽지 못함. 자동 탐색으로 fallback.")
+                cap.release()
+        else:
+            print(f"[WARN] {dev} 를 열 수 없음. 자동 탐색으로 fallback.")
+
+    # -----------------------------------------
+    # 1) RealSense 자동 탐색
+    # -----------------------------------------
     print("[INFO] RealSense 카메라 자동 탐색: `v4l2-ctl --list-devices` 실행")
 
     try:
@@ -98,7 +128,6 @@ def open_realsense_capture():
 
     for line in lines:
         if not line.strip():
-            # 빈 줄 → 이전 블록 종료
             if current_name is not None:
                 devices_info.append((current_name, list(current_devices)))
             current_name = None
@@ -106,18 +135,15 @@ def open_realsense_capture():
             continue
 
         if not line.startswith("\t") and not line.startswith(" "):
-            # 새 장치 이름 라인
             if current_name is not None:
                 devices_info.append((current_name, list(current_devices)))
             current_name = line.strip().rstrip(":")
             current_devices = []
         else:
-            # /dev/videoX 라인
             dev_path = line.strip()
             if dev_path.startswith("/dev/video"):
                 current_devices.append(dev_path)
 
-    # 마지막 블록 처리
     if current_name is not None:
         devices_info.append((current_name, list(current_devices)))
 
@@ -168,7 +194,11 @@ def open_realsense_capture():
             continue
 
         idx = int(m.group(1))
-        print(f"[INFO] 사용 가능한 RealSense 카메라 확정: device='{dev}', index={idx}")
+        try:
+            print(f"[INFO] 사용 가능한 RealSense 카메라 확정: device='{dev}', index={idx}, frame_shape={frame.shape}")
+        except Exception:
+            print(f"[INFO] 사용 가능한 RealSense 카메라 확정: device='{dev}', index={idx}, frame_shape=unknown")
+
         # cap은 열어둔 채로 반환
         return cap, idx, dev
 
@@ -336,6 +366,15 @@ class GestureCamera(threading.Thread):
                 except Exception:
                     print(f"[DEBUG] frame_count={frame_count}, frame_shape=unknown")
 
+            # ★ 60번째 프레임을 디버그용으로 저장
+            if frame_count == 60:
+                debug_path = "/tmp/gesture_debug_frame.jpg"
+                try:
+                    cv2.imwrite(debug_path, frame_bgr)
+                    print(f"[DEBUG] 디버그 프레임 저장: {debug_path}")
+                except Exception as e:
+                    print(f"[WARN] 디버그 프레임 저장 실패: {e}")
+
             # 최신 프레임 저장 (freeze 여부와 관계 없이 계속 업데이트)
             with self._lock:
                 self._latest_frame_bgr = frame_bgr
@@ -376,7 +415,6 @@ class GestureCamera(threading.Thread):
 # ==========================
 # 2) Gemini로 액션 결정 (초기 gesture/instruction 사용)
 # ==========================
-
 def _normalize_gesture_for_prompt(gesture: str | None) -> str:
     """
     제스처 문자열을 prompt.txt에서 기대하는
@@ -523,7 +561,7 @@ def main():
                 print("[MAIN] STT 결과가 비어 있음, 다시 대기")
                 continue
 
-            # --- 수정된 부분: freeze 하기 전에 제스처가 잡힐 때까지 최대 2초 기다리기 ---
+            # --- freeze 하기 전에 제스처가 잡힐 때까지 최대 2초 기다리기 ---
             wait_start = time.time()
             while True:
                 g_now = cam_thread.get_gesture()
