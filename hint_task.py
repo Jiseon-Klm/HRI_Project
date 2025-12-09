@@ -272,33 +272,31 @@ class GestureCamera(threading.Thread):
                 print(f"[GESTURE] {self._gesture}")
 
     def _infer_gesture_from_hand(self, hand_landmarks):
-        """
-        단순 규칙 기반 제스처 해석 (좌/우만):
-
-        - 손목(WRIST) → 검지 손끝(INDEX_TIP) 방향 벡터 (dx, dy) 사용
-        - |dx|가 |dy|보다 충분히 크면 "수평에 가깝다"고 판단
-            → dx > 0  : turn right
-            → dx < 0  : turn left
-        - 그 외 (수직에 가깝거나 애매한 경우) → 제스처 없음 (None)
-
-        ※ 이미지 좌표 기준: x 오른쪽 증가, y 아래쪽 증가
-        """
         WRIST = 0
         INDEX_TIP = 8
-
+    
         wrist = hand_landmarks.landmark[WRIST]
         tip = hand_landmarks.landmark[INDEX_TIP]
-
+    
         dx = tip.x - wrist.x
-        dy = tip.y - wrist.y  # 아래로 증가
-
-        # 너무 짧은 벡터는 노이즈로 간주
-        if (dx ** 2 + dy ** 2) < 1e-4:
+        dy = tip.y - wrist.y  # y는 아래로 증가 (이미지 좌표)
+    
+        # 너무 짧으면 노이즈
+        if (dx**2 + dy**2) < 1e-4:
             print("[DEBUG] 너무 짧은 벡터라 노이즈로 간주")
             return None
-
+    
         ratio = abs(dx) / (abs(dy) + 1e-6)
         print(f"[DEBUG] dx={dx:.4f}, dy={dy:.4f}, |dx|/|dy|={ratio:.2f}")
-
-        # 수평 성분이 수직 성분보다 충분히 크지 않으면 → 제스처 없음
-        if abs(dx) < self.horizontal_ratio_threshold * a*
+    
+        # *** 여기 문제났던 줄 ***
+        if abs(dx) < self.horizontal_ratio_threshold * abs(dy):
+            print("[DEBUG] 수평 성분이 부족해서 제스처로 인정 안 함")
+            return None
+    
+        if dx > 0:
+            print("[DEBUG] → turn right 후보")
+            return "turn right"
+        else:
+            print("[DEBUG] → turn left 후보")
+            return "turn left"
