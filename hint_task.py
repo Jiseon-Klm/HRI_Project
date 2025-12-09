@@ -265,7 +265,7 @@ class GestureCamera(threading.Thread):
     - main에서 한 번 freeze 요청이 오면, 그 이후로는 제스처를 더 이상 업데이트하지 않음
     """
 
-    def __init__(self, cap, horizontal_ratio_threshold=1.3):
+    def __init__(self, cap, horizontal_ratio_threshold=1.3, debug=False):
         """
         cap: open_realsense_capture() 에서 이미 '프레임까지' 확인하고 넘겨준
              cv2.VideoCapture 객체 (release 미호출 상태)
@@ -273,6 +273,9 @@ class GestureCamera(threading.Thread):
             |dx| >= horizontal_ratio_threshold * |dy| 일 때만
             '수평에 가깝게 뻗은 손가락'으로 간주.
             값이 클수록 '옆으로 더 확실히 뻗은' 제스처만 인식.
+        debug:
+            True면 프레임 정보/검출 결과를 좀 더 많이 로그로 찍고,
+            첫 프레임을 파일로 저장해서 실제로 어떤 영상인지 확인할 수 있게 함.
         """
         super().__init__(daemon=True)
         self.cap = cap
@@ -295,6 +298,13 @@ class GestureCamera(threading.Thread):
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+
+        # === 디버그 관련 ===
+        self.debug = debug
+        self._first_frame_dumped = False
+        self._frame_count = 0
+        self._hand_detect_count = 0
+
 
     def stop(self):
         self.running = False
@@ -393,6 +403,20 @@ class GestureCamera(threading.Thread):
                 time.sleep(0.05)
                 continue
 
+            self._frame_count += 1
+
+            # === 디버그: 첫 프레임 한 번 저장해서 실제로 RGB인지 확인 ===
+            if self.debug and not self._first_frame_dumped:
+                try:
+                    os.makedirs("/tmp/gesture_debug", exist_ok=True)
+                    dump_path = "/tmp/gesture_debug/first_frame_bgr.jpg"
+                    cv2.imwrite(dump_path, frame_bgr)
+                    print(f"[DEBUG] GestureCamera: 첫 프레임을 {dump_path} 에 저장했습니다.")
+                    print(f"[DEBUG] frame shape={frame_bgr.shape}, dtype={frame_bgr.dtype}, mean={frame_bgr.mean():.2f}")
+                    self._first_frame_dumped = True
+                except Exception as e:
+                    print(f"[DEBUG] 첫 프레임 저장 실패: {e}")
+
             # 최신 프레임 저장 (freeze 여부와 관계 없이 계속 업데이트)
             with self._lock:
                 self._latest_frame_bgr = frame_bgr
@@ -409,10 +433,19 @@ class GestureCamera(threading.Thread):
             new_gesture = None  # 기본값: 이번 프레임에서는 새 제스처 없음
 
             if result.multi_hand_landmarks:
+                self._hand_detect_count += 1
+                if self.debug and self._hand_detect_count % 30 == 0:
+                    # 대략 1초마다 한 번씩 손 검출 카운트 찍기
+                    print(f"[DEBUG] MediaPipe: 손 검출 누적 {self._hand_detect_count} / 프레임 {self._frame_count}")
+
                 hand_lms = result.multi_hand_landmarks[0]
                 g = self._infer_gesture_from_hand(hand_lms)
                 if g is not None:
                     new_gesture = g
+            else:
+                if self.debug and self._frame_count % 60 == 0:
+                    # 2초마다 한 번씩 "손 못 찾음" 로그
+                    print(f"[DEBUG] MediaPipe: 이 시점까지 손 검출 없음 (frame={self._frame_count})")
 
             # 제스처 갱신 (None이면 무시 / freeze면 무시)
             self._update_gesture(new_gesture)
