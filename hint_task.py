@@ -265,7 +265,7 @@ class GestureCamera(threading.Thread):
     - main에서 한 번 freeze 요청이 오면, 그 이후로는 제스처를 더 이상 업데이트하지 않음
     """
 
-    def __init__(self, cap, horizontal_ratio_threshold=1.3, debug=False):
+    def __init__(self, cap, horizontal_ratio_threshold=1.1, debug=False):
         """
         cap: open_realsense_capture() 에서 이미 '프레임까지' 확인하고 넘겨준
              cv2.VideoCapture 객체 (release 미호출 상태)
