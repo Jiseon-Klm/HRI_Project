@@ -22,6 +22,8 @@ import os
 import cv2
 import mediapipe as mp
 import numpy as np
+from collections import deque
+
 
 from google import genai
 from google.genai import types
