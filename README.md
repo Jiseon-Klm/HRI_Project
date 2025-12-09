@@ -9,7 +9,7 @@ docker run -it --rm \
     --privileged \
     -v /dev/bus/usb:/dev/bus/usb \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
-    -v /home/aprl/Desktop/hri:/ros2_ws \
+    -v /home/aprl/Desktop/hri:/ros2_ws/ws \
     --device /dev/snd:/dev/snd \
     -e DISPLAY=$DISPLAY \
     hri_project
