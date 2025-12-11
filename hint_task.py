@@ -66,16 +66,15 @@ def load_prompt_template(path: str = "prompt.txt") -> str:
 # ==========================
 def open_realsense_capture():
     """
-    1) `v4l2-ctl --list-devices`에서 'RealSense'가 들어간 디바이스 블록을 찾고
-    2) 그 블록 안의 /dev/videoX 후보들에 대해:
-         - OpenCV(cv2.VideoCapture)로 dev를 열어서
-         - 해상도 설정 후 frame을 한 번 읽어봄
-       → 정상 프레임이 나오면 그 cap을 그대로 반환.
+    RealSense를 자동 탐색하되,
+    - v4l2-ctl --list-formats-ext 로 픽셀 포맷을 확인해서
+      '컬러 스트림 가능성이 높은 /dev/videoX'를 먼저 시도한다.
+    - 대표적으로 MJPG, YUYV, RGB3, BGR3 등을 컬러 후보로 본다.
 
     반환: (cap, index, dev_path)
-    - cap: 이미 열린 cv2.VideoCapture 객체 (release 하지 않고 돌려줌)
-    - index: /dev/videoX 의 X
-    - dev_path: "/dev/videoX" 문자열
+      - cap      : 열린 cv2.VideoCapture (release 하지 않은 상태)
+      - index    : /dev/videoX 의 X
+      - dev_path : "/dev/videoX"
     """
     print("[INFO] RealSense 카메라 자동 탐색: `v4l2-ctl --list-devices` 실행")
 
@@ -141,8 +140,44 @@ def open_realsense_capture():
             "[ERROR] RealSense 장치는 있으나 /dev/video* 노드를 찾지 못했습니다."
         )
 
-    # 각 후보 dev에 대해 실제로 OpenCV로 열고, 프레임을 읽어보며 검사
+    # ---- 1단계: v4l2-ctl --list-formats-ext 로 "컬러 후보" 점수 매기기 ----
+    color_keywords = ("mjpg", "yuyv", "rgb3", "bgr3")
+    dev_score = {}  # dev_path -> score (높을수록 컬러일 확률 ↑)
+
     for dev in candidate_devs:
+        try:
+            fmt_proc = subprocess.run(
+                ["v4l2-ctl", "-d", dev, "--list-formats-ext"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+            fmt_out = fmt_proc.stdout.lower()
+        except Exception as e:
+            print(f"[WARN] {dev} 의 포맷 정보를 가져올 수 없습니다: {e}")
+            dev_score[dev] = 0
+            continue
+
+        score = 0
+        for kw in color_keywords:
+            if kw in fmt_out:
+                score += 1
+
+        dev_score[dev] = score
+        print(f"[DEBUG] {dev} pixel-format score={score}")
+
+    # 컬러 후보(dev_score가 큰 dev)를 먼저 시도하도록 정렬
+    ordered_devs = sorted(
+        candidate_devs,
+        key=lambda d: dev_score.get(d, 0),
+        reverse=True,
+    )
+
+    print(f"[DEBUG] RealSense dev 시도 순서: {ordered_devs}")
+
+    # ---- 2단계: 실제로 VideoCapture 열어서 프레임 테스트 ----
+    for dev in ordered_devs:
         print(f"[INFO] RealSense 후보 노드 테스트: {dev}")
         cap = cv2.VideoCapture(dev)
         if not cap.isOpened():
@@ -150,20 +185,56 @@ def open_realsense_capture():
             cap.release()
             continue
 
-        # 해상도 설정
+        # 해상도 / 포맷 설정 (가능하면 MJPG로 강제)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        except Exception:
+            pass
 
-        ret, frame = cap.read()
-        print("shape:", frame.shape, "dtype:", frame.dtype)
-        cv2.imwrite("./debug_first_frame.jpg", frame)
-        cap.release()
-        if not ret or frame is None or frame.size == 0:
+        # 프레임 여러 장 읽어서 안정성 확인
+        ok_any = False
+        frame = None
+        for _ in range(5):
+            ret, f = cap.read()
+            if ret and f is not None and f.size > 0:
+                frame = f
+                ok_any = True
+                break
+            time.sleep(0.05)
+
+        if not ok_any or frame is None:
             print(f"[WARN] {dev} 에서 유효한 프레임을 읽지 못했습니다.")
             cap.release()
             continue
 
-        # 여기까지 왔으면 실제로 usable한 스트림이라고 판단
+        # 간단한 컬러 sanity check:
+        #  - 3채널인지
+        #  - B/G/R 채널 평균값이 한 채널만 압도적으로 크지 않은지
+        if len(frame.shape) != 3 or frame.shape[2] != 3:
+            print(f"[WARN] {dev} 프레임이 3채널이 아님: shape={frame.shape}")
+            cap.release()
+            continue
+
+        b_mean = float(frame[:, :, 0].mean())
+        g_mean = float(frame[:, :, 1].mean())
+        r_mean = float(frame[:, :, 2].mean())
+        channel_means = (b_mean, g_mean, r_mean)
+        max_mean = max(channel_means)
+        min_mean = max(min(channel_means), 1e-3)  # 0으로 나누기 방지
+        ratio = max_mean / min_mean
+
+        print(f"[DEBUG] {dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
+
+        # 너무 한 채널만 튀면 (ex. 초록색 화면) 컬러가 아니라 Bayer/raw로 판단하고 패스
+        if ratio > 3.0:
+            print(f"[WARN] {dev} 프레임이 한 채널에 강하게 치우침 → 컬러 스트림 아님으로 판단하고 패스")
+            cap.release()
+            continue
+
+        # 여기까지 왔으면 "쓸만한 컬러 스트림"으로 간주
         m = re.search(r"/dev/video(\d+)", dev)
         if not m:
             print(f"[WARN] {dev} 의 인덱스를 파싱하지 못했습니다.")
@@ -171,14 +242,14 @@ def open_realsense_capture():
             continue
 
         idx = int(m.group(1))
-        print(f"[INFO] 사용 가능한 RealSense 카메라 확정: device='{dev}', index={idx}")
-        # cap은 열어둔 채로 반환
+        print(f"[INFO] 사용 가능한 RealSense 컬러 카메라 확정: device='{dev}', index={idx}")
+        # !!! 여기서는 더 이상 cap.release() 하지 않는다 !!!
         return cap, idx, dev
 
     # 아무 dev도 통과하지 못한 경우
     raise RuntimeError(
-        "[ERROR] RealSense /dev/video* 노드 중 어느 것도 OpenCV로 열거나 프레임을 읽을 수 없습니다.\n"
-        "컨테이너에서 RealSense 권한/udev/--device 설정을 다시 확인해보세요."
+        "[ERROR] RealSense /dev/video* 노드 중 컬러 스트림을 찾지 못했습니다.\n"
+        "v4l2-ctl --list-formats-ext 로 각 노드의 포맷을 직접 확인해보세요."
     )
 
 
