@@ -34,6 +34,8 @@ from config import (
     # GEMINI_MODEL_NAME # 더 이상 사용 안 함
 )
 
+os.environ["OPENAI_API_KEY"] = "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"
+
 # protobuf deprecation warning 숨기기 (STT나 다른 모듈에서 나오는 경고 방지용)
 warnings.filterwarnings(
     "ignore",
