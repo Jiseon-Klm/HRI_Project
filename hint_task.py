@@ -126,7 +126,7 @@ def open_realsense_capture():
                 max_mean = max(channel_means)
                 min_mean = max(min(channel_means), 1e-3)
                 ratio = max_mean / min_mean
-                print(f"[DEBUG] {manual_dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
+                # print(f"[DEBUG] {manual_dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
 
                 if ratio <= 3.0:
                     print(f"[INFO] CAMERA_DEVICE_ID로 지정된 컬러 카메라 사용: {manual_dev}")
