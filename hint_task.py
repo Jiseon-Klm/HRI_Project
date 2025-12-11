@@ -9,7 +9,7 @@ gesture_nav_agent.py
 - 이후에는 마이크는 더 이상 사용하지 않고,
   6초 단위로 현재 카메라 RGB 관측 + (초기 제스처, 초기 instruction)을
   Gemini 멀티모달 모델에 넣어서
-  action_space = ["forward", "left", "right", "stop", "goal_signal"] 중
+  action_space = ["forward", "left", "right", "stop", "goal"] 중
   next_action을 계속 업데이트해서 터미널에 출력.
 """
 
@@ -23,8 +23,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 from llm_stt_tts import STTProcessor
 from config import (
@@ -46,7 +45,7 @@ ACTION_SPACE = ["forward", "left", "right", "stop", "goal"]
 
 # 프롬프트 템플릿 캐시용 전역 변수
 PROMPT_TEMPLATE: str | None = None
-
+CHATGPT_MODEL_NAME = "gpt-5"  
 
 def load_prompt_template(path: str = "prompt.txt") -> str:
     """
@@ -529,7 +528,8 @@ def _normalize_gesture_for_prompt(gesture: str | None) -> str:
     return "none"
 
 
-def query_gemini_action(client, model_name, frame_bgr, gesture, spoken_text):
+def query_chatgpt_action(client: OpenAI, model_name: str,
+                         frame_bgr, gesture, spoken_text):
     """
     - frame_bgr: 최신 카메라 RGB 관측 (BGR 포맷)
     - gesture : "turn right" / "turn left" / None (초기 제스처)
@@ -537,35 +537,31 @@ def query_gemini_action(client, model_name, frame_bgr, gesture, spoken_text):
 
     반환: (next_action, full_text)
       - next_action ∈ ACTION_SPACE
-      - full_text  : Gemini가 생성한 전체 응답 문자열
+      - full_text  : ChatGPT가 생성한 전체 응답 문자열
     """
     if frame_bgr is None:
         print("[WARN] frame_bgr가 None → 안전하게 'stop' 반환")
         return "stop", "[LLM] no frame_bgr (returned 'stop')"
 
-    ok, jpg = cv2.imencode(".jpg", frame_bgr)
-    if not ok:
-        print("[ERROR] 이미지 JPEG 인코딩 실패 → 'stop' 반환")
+    try:
+        data_url = _encode_frame_to_data_url(frame_bgr)
+    except Exception as e:
+        print(f"[ERROR] 이미지 인코딩 실패 ({e}) → 'stop' 반환")
         return "stop", "[LLM] jpeg encode failed (returned 'stop')"
 
-    image_part = types.Part.from_bytes(
-        data=jpg.tobytes(),
-        mime_type="image/jpeg",
-    )
-
-    # gesture가 아직 한 번도 인식 안된 경우 → "none"으로
+    # gesture가 아직 한 번도 인식 안된 경우 → "none"
     gesture_str = _normalize_gesture_for_prompt(gesture)
     spoken_text = spoken_text or ""
 
-    print(f"[DEBUG] Gemini spoken_text : {spoken_text}")
-    print(f"[DEBUG] Gemini gesture_str : {gesture_str}")
+    print(f"[DEBUG] ChatGPT spoken_text : {spoken_text}")
+    print(f"[DEBUG] ChatGPT gesture_str : {gesture_str}")
 
     # system_instruction은 high-level role만 지정하고
     # 상세 정책은 prompt.txt에 포함되어 있음
     system_instruction = (
         "You are a navigation decision module for a mobile robot. "
         "You must follow the prompt instructions and finally choose ONE action "
-        "from this action_space: forward, left, right, stop, goal_signal. "
+        "from this action_space: forward, left, right, stop, goal. "
         "In your answer, clearly state the final chosen action following the required format."
     )
 
@@ -579,36 +575,59 @@ def query_gemini_action(client, model_name, frame_bgr, gesture, spoken_text):
         .replace("{gesture_str}", gesture_str)
     )
 
-    # 디버그용: 프롬프트 앞부분만 잠깐 찍어보고 싶으면 주석 해제
-    # print("===== PROMPT HEAD =====")
-    # print(prompt[:400])
-    # print("=======================")
+    try:
+        resp = client.responses.create(
+            model=model_name,
+            # 필요하면 reasoning/text 옵션 추가 가능
+            input=[
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": system_instruction}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": prompt,
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": data_url,
+                        },
+                    ],
+                },
+            ],
+        )
+    except Exception as e:
+        print(f"[ERROR] ChatGPT API 호출 실패: {e} → 'stop' 반환")
+        return "stop", f"[LLM] ChatGPT API error ({e}) (returned 'stop')"
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            system_instruction,
-            image_part,
-            prompt,
-        ],
-    )
+    full_text = (resp.output_text or "").strip()
+    full_lower = full_text.lower()
 
-    # 전체 텍스트
-    full_text = (response.text or "").strip()
-    # full_lower = full_text.lower()
+    # --- next_action 파싱 ---
+    # 1) 첫 줄 첫 토큰 우선
+    first_line = full_lower.splitlines()[0] if full_lower else ""
+    first_token = first_line.split()[0] if first_line else ""
 
-    # # next_action 파싱: 맨 앞 토큰 기준 우선
-    # for action in ACTION_SPACE:
-    #     if full_lower.startswith(action):
-    #         return action, full_text
+    if first_token in ACTION_SPACE:
+        next_action = first_token
+    else:
+        # 2) 포함 여부라도 체크
+        next_action = None
+        for action in ACTION_SPACE:
+            if action in full_lower:
+                next_action = action
+                break
 
-    # # 그게 안 되면, 포함 여부라도 체크
-    # for action in ACTION_SPACE:
-    #     if action in full_lower:
-    #         return action, full_text
+        # 3) 그래도 못 찾으면 stop
+        if next_action is None:
+            next_action = "stop"
 
-    # 최후의 보루: stop
-    return full_text
+    return next_action, full_text
 
 
 # ==========================
@@ -630,6 +649,7 @@ def main():
         print(e)
         print("[FATAL] RealSense 카메라를 찾을 수 없어 종료합니다.")
         return
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
     # 1) 제스처 카메라 쓰레드 시작 (이미 열린 cap을 넘김)
     cam_thread = GestureCamera(cap=cap)
@@ -681,20 +701,22 @@ def main():
     print("\n[INFO] 초기 instruction + 제스처 확보 완료.")
     print("[INFO] 이후에는 마이크는 더 이상 사용하지 않고,")
     print("       6초마다 카메라 RGB + (초기 제스처, 초기 instruction)을 기반으로")
-    print("       Gemini에게 다음 액션을 질의합니다.\n")
+    print("       ChatGPT에게 다음 액션을 질의합니다.\n")
 
     # ==========================
     # 3-2) 6초 주기로 카메라 뷰 기반 next_action 업데이트
     # ==========================
+    i=0
     try:
         while True:
             frame_bgr = cam_thread.get_latest_frame()
             gesture_now = cam_thread.get_gesture()  # freeze 이후엔 항상 initial_gesture와 동일
+            cv2.imwrite(f"frame_{i}.jpg", frame_bgr)
 
             # next_action과 전체 LLM 응답을 모두 받음
-            next_action, llm_text = query_gemini_action(
+            next_action, llm_text = query_chatgpt_action(
                 client=client,
-                model_name=GEMINI_MODEL_NAME,
+                model_name=CHATGPT_MODEL_NAME,
                 frame_bgr=frame_bgr,
                 gesture=initial_gesture,
                 spoken_text=spoken_text_initial,
@@ -709,7 +731,7 @@ def main():
             print("--------------------------------------------------------")
             print("-" * 60)
 
-            #time.sleep(6.0)
+            time.sleep(6.0)
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
