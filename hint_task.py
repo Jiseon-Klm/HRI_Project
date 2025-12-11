@@ -62,73 +62,15 @@ def load_prompt_template(path: str = "prompt.txt") -> str:
 
 
 # ==========================
-# 0) RealSense 카메라 열기 관련 유틸
+# 0) RealSense 카메라 열기
 # ==========================
-
-def is_rgb_stream_device(dev_path: str) -> bool:
-    """
-    주어진 /dev/videoX 노드가 '컬러(RGB) 스트림'을 제공하는지
-    v4l2-ctl --list-formats-ext 결과를 기반으로 논리적으로 판별한다.
-
-    - 픽셀 포맷이 GREY, Y8, Y16, Z16 등 '단일 채널/Depth' 위주이면 IR/Depth로 간주
-    - 픽셀 포맷에 RGB, YUYV, MJPG, NV12 등 '컬러 포맷'이 하나라도 있으면 RGB 후보로 간주
-    """
-    try:
-        proc = subprocess.run(
-            ["v4l2-ctl", "--device", dev_path, "--list-formats-ext"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
-        )
-    except Exception as e:
-        print(f"[WARN] {dev_path}: v4l2-ctl --list-formats-ext 실패: {e}")
-        return False
-
-    out = proc.stdout.lower()
-
-    # 1) 장치가 아예 "Video Capture" 타입을 지원하는지 확인 (webcam/카메라)
-    if "type: video capture" not in out:
-        print(f"[DEBUG] {dev_path}: 'Type: Video Capture' 포맷이 없음.")
-        return False
-
-    # 2) 모노/Depth로 확실한 포맷 키워드들
-    mono_keywords = [
-        "greyscale", "greyscale", "grey", "y8", "y10", "y12", "y16",
-        "z16", "depth", "infrared", "ir",
-    ]
-
-    # 3) 컬러 포맷(멀티 채널)로 간주할 키워드들
-    color_keywords = [
-        "rgb", "bgr", "yuyv", "uyvy", "nv12", "nv21", "mjpg", "mjpeg", "yuv",
-    ]
-
-    # 컬러 포맷이 하나라도 있으면 RGB 후보
-    has_color = any(kw in out for kw in color_keywords)
-
-    if has_color:
-        print(f"[DEBUG] {dev_path}: 컬러 포맷 감지 → RGB 후보")
-        return True
-
-    # 컬러는 없고, 모노/Depth 키워드만 있으면 IR/Depth로 간주
-    if any(kw in out for kw in mono_keywords):
-        print(f"[DEBUG] {dev_path}: 모노/Depth 포맷만 감지 → RGB 아님")
-        return False
-
-    # 여기까지 왔는데도 컬러/모노를 명확히 구분 못 하면 보수적으로 False
-    print(f"[DEBUG] {dev_path}: 컬러/모노 판별 불가 → RGB 아님으로 처리")
-    return False
-
-
 def open_realsense_capture():
     """
     1) `v4l2-ctl --list-devices`에서 'RealSense'가 들어간 디바이스 블록을 찾고
-    2) 그 블록 안의 /dev/videoX 후보들 중에서
-         - v4l2-ctl --device /dev/videoX --list-formats-ext 결과를 기반으로
-           '컬러(RGB) 스트림'을 제공하는 노드만 필터링
-         - 그 RGB 후보 노드들에 대해 OpenCV(cv2.VideoCapture)로 열어서
-           실제로 프레임이 나오는지 확인
-       → 정상 RGB 프레임이 나오면 그 cap을 그대로 반환.
+    2) 그 블록 안의 /dev/videoX 후보들에 대해:
+         - OpenCV(cv2.VideoCapture)로 dev를 열어서
+         - 해상도 설정 후 frame을 한 번 읽어봄
+       → 정상 프레임이 나오면 그 cap을 그대로 반환.
 
     반환: (cap, index, dev_path)
     - cap: 이미 열린 cv2.VideoCapture 객체 (release 하지 않고 돌려줌)
@@ -180,10 +122,7 @@ def open_realsense_capture():
         devices_info.append((current_name, list(current_devices)))
 
     # RealSense 관련 블록만 필터링
-    rs_blocks = [
-        (name, devs) for name, devs in devices_info
-        if "realsense" in name.lower()
-    ]
+    rs_blocks = [(name, devs) for name, devs in devices_info if "realsense" in name.lower()]
 
     if not rs_blocks:
         raise RuntimeError(
@@ -192,31 +131,19 @@ def open_realsense_capture():
         )
 
     # RealSense 블록 내 모든 /dev/video* 후보 수집
-    all_candidate_devs = []
+    candidate_devs = []
     for name, devs in rs_blocks:
         print(f"[DEBUG] RealSense block: '{name}' -> {devs}")
-        all_candidate_devs.extend(devs)
+        candidate_devs.extend(devs)
 
-    if not all_candidate_devs:
+    if not candidate_devs:
         raise RuntimeError(
             "[ERROR] RealSense 장치는 있으나 /dev/video* 노드를 찾지 못했습니다."
         )
 
-    # 1차 필터: 'RGB/컬러 스트림'을 제공하는 노드만 남기기
-    rgb_candidate_devs = []
-    for dev in all_candidate_devs:
-        if is_rgb_stream_device(dev):
-            rgb_candidate_devs.append(dev)
-
-    if not rgb_candidate_devs:
-        raise RuntimeError(
-            "[ERROR] RealSense /dev/video* 중 RGB(컬러) 포맷을 제공하는 노드를 찾지 못했습니다.\n"
-            "v4l2-ctl --device /dev/videoX --list-formats-ext 출력으로 포맷 구성을 확인해보세요."
-        )
-
-    # 2차 필터: RGB 후보 노드들에 대해 실제로 프레임이 잘 나오는지 확인
-    for dev in rgb_candidate_devs:
-        print(f"[INFO] RealSense RGB 후보 노드 테스트: {dev}")
+    # 각 후보 dev에 대해 실제로 OpenCV로 열고, 프레임을 읽어보며 검사
+    for dev in candidate_devs:
+        print(f"[INFO] RealSense 후보 노드 테스트: {dev}")
         cap = cv2.VideoCapture(dev)
         if not cap.isOpened():
             print(f"[WARN] {dev} 를 열 수 없습니다 (isOpened() == False)")
@@ -233,7 +160,7 @@ def open_realsense_capture():
             cap.release()
             continue
 
-        # 여기까지 왔으면 실제로 usable한 'RGB 컬러 스트림'이라고 판단
+        # 여기까지 왔으면 실제로 usable한 스트림이라고 판단
         m = re.search(r"/dev/video(\d+)", dev)
         if not m:
             print(f"[WARN] {dev} 의 인덱스를 파싱하지 못했습니다.")
@@ -241,14 +168,14 @@ def open_realsense_capture():
             continue
 
         idx = int(m.group(1))
-        print(f"[INFO] 사용 가능한 RealSense RGB 카메라 확정: device='{dev}', index={idx}")
+        print(f"[INFO] 사용 가능한 RealSense 카메라 확정: device='{dev}', index={idx}")
         # cap은 열어둔 채로 반환
         return cap, idx, dev
 
-    # RGB 후보들 중 어느 것도 실제로 프레임을 못 읽는 경우
+    # 아무 dev도 통과하지 못한 경우
     raise RuntimeError(
-        "[ERROR] RealSense RGB /dev/video* 노드 중 어느 것도 OpenCV로 프레임을 읽을 수 없습니다.\n"
-        "컨테이너/호스트의 권한, udev, --device 설정을 다시 확인해보세요."
+        "[ERROR] RealSense /dev/video* 노드 중 어느 것도 OpenCV로 열거나 프레임을 읽을 수 없습니다.\n"
+        "컨테이너에서 RealSense 권한/udev/--device 설정을 다시 확인해보세요."
     )
 
 
@@ -265,7 +192,7 @@ class GestureCamera(threading.Thread):
     - main에서 한 번 freeze 요청이 오면, 그 이후로는 제스처를 더 이상 업데이트하지 않음
     """
 
-    def __init__(self, cap, horizontal_ratio_threshold=1.1, debug=False):
+    def __init__(self, cap, horizontal_ratio_threshold=1.3):
         """
         cap: open_realsense_capture() 에서 이미 '프레임까지' 확인하고 넘겨준
              cv2.VideoCapture 객체 (release 미호출 상태)
@@ -273,9 +200,6 @@ class GestureCamera(threading.Thread):
             |dx| >= horizontal_ratio_threshold * |dy| 일 때만
             '수평에 가깝게 뻗은 손가락'으로 간주.
             값이 클수록 '옆으로 더 확실히 뻗은' 제스처만 인식.
-        debug:
-            True면 프레임 정보/검출 결과를 좀 더 많이 로그로 찍고,
-            첫 프레임을 파일로 저장해서 실제로 어떤 영상인지 확인할 수 있게 함.
         """
         super().__init__(daemon=True)
         self.cap = cap
@@ -298,13 +222,6 @@ class GestureCamera(threading.Thread):
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-
-        # === 디버그 관련 ===
-        self.debug = debug
-        self._first_frame_dumped = False
-        self._frame_count = 0
-        self._hand_detect_count = 0
-
 
     def stop(self):
         self.running = False
@@ -403,20 +320,6 @@ class GestureCamera(threading.Thread):
                 time.sleep(0.05)
                 continue
 
-            self._frame_count += 1
-
-            # === 디버그: 첫 프레임 한 번 저장해서 실제로 RGB인지 확인 ===
-            if self.debug and not self._first_frame_dumped:
-                try:
-                    os.makedirs("/tmp/gesture_debug", exist_ok=True)
-                    dump_path = "/tmp/gesture_debug/first_frame_bgr.jpg"
-                    cv2.imwrite(dump_path, frame_bgr)
-                    print(f"[DEBUG] GestureCamera: 첫 프레임을 {dump_path} 에 저장했습니다.")
-                    print(f"[DEBUG] frame shape={frame_bgr.shape}, dtype={frame_bgr.dtype}, mean={frame_bgr.mean():.2f}")
-                    self._first_frame_dumped = True
-                except Exception as e:
-                    print(f"[DEBUG] 첫 프레임 저장 실패: {e}")
-
             # 최신 프레임 저장 (freeze 여부와 관계 없이 계속 업데이트)
             with self._lock:
                 self._latest_frame_bgr = frame_bgr
@@ -433,19 +336,10 @@ class GestureCamera(threading.Thread):
             new_gesture = None  # 기본값: 이번 프레임에서는 새 제스처 없음
 
             if result.multi_hand_landmarks:
-                self._hand_detect_count += 1
-                if self.debug and self._hand_detect_count % 30 == 0:
-                    # 대략 1초마다 한 번씩 손 검출 카운트 찍기
-                    print(f"[DEBUG] MediaPipe: 손 검출 누적 {self._hand_detect_count} / 프레임 {self._frame_count}")
-
                 hand_lms = result.multi_hand_landmarks[0]
                 g = self._infer_gesture_from_hand(hand_lms)
                 if g is not None:
                     new_gesture = g
-            else:
-                if self.debug and self._frame_count % 60 == 0:
-                    # 2초마다 한 번씩 "손 못 찾음" 로그
-                    print(f"[DEBUG] MediaPipe: 이 시점까지 손 검출 없음 (frame={self._frame_count})")
 
             # 제스처 갱신 (None이면 무시 / freeze면 무시)
             self._update_gesture(new_gesture)
@@ -528,6 +422,11 @@ def query_gemini_action(client, model_name, frame_bgr, gesture, spoken_text):
         .replace("{spoken_text}", spoken_text)
         .replace("{gesture_str}", gesture_str)
     )
+
+    # 디버그용: 프롬프트 앞부분만 잠깐 찍어보고 싶으면 주석 해제
+    # print("===== PROMPT HEAD =====")
+    # print(prompt[:400])
+    # print("=======================")
 
     response = client.models.generate_content(
         model=model_name,
