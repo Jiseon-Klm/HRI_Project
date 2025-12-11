@@ -8,7 +8,9 @@ gesture_nav_agent.py
 - 이때 사용자가 말하는 동안의 제스처를 초기 한 번만 캡처해서 고정함
 - 이후에는 마이크는 더 이상 사용하지 않고,
   6초 단위로 현재 카메라 RGB 관측 + (초기 제스처, 초기 instruction)을
-  Gemini 멀티모달 모델에 넣어서 응답을 터미널에 출력.
+  Gemini 멀티모달 모델에 넣어서
+  action_space = ["forward", "left", "right", "stop", "goal_signal"] 중
+  next_action을 계속 업데이트해서 터미널에 출력.
 """
 
 import threading
@@ -16,7 +18,6 @@ import time
 import subprocess
 import re
 import os
-import warnings
 
 import cv2
 import mediapipe as mp
@@ -31,6 +32,7 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_MODEL_NAME,
 )
+import warnings  # <- 새로 추가
 
 # protobuf deprecation warning 숨기기
 warnings.filterwarnings(
@@ -38,8 +40,8 @@ warnings.filterwarnings(
     message="SymbolDatabase.GetPrototype() is deprecated. Please use message_factory.GetMessageClass() instead.",
     category=UserWarning,
 )
-
-# (지금은 사용하지 않지만, 나중에 액션 파싱 복원할 때 쓸 수 있음)
+# LLM이 최종적으로 선택해야 하는 액션 공간
+# prompt.txt와 정확히 동일한 토큰을 사용해야 파싱이 잘 됨
 ACTION_SPACE = ["forward", "left", "right", "stop", "goal"]
 
 # 프롬프트 템플릿 캐시용 전역 변수
@@ -85,6 +87,7 @@ def open_realsense_capture():
        - 컬러 후보(dev_score > 0)만 우선 시도한다.
        - 컬러 후보 중에서만 "멀쩡한 컬러 프레임"이 나오면 그걸 사용.
        - 컬러 후보에서도 아무것도 못 찾으면,
+         더 이상 다른 /dev/videoX들(0,1,2,3,5...)을 억지로 시도하지 않고
          RuntimeError로 빠르게 실패한다. (timeout 지옥 방지)
 
     반환: (cap, index, dev_path)
@@ -130,9 +133,11 @@ def open_realsense_capture():
                 max_mean = max(channel_means)
                 min_mean = max(min(channel_means), 1e-3)
                 ratio = max_mean / min_mean
+                # print(f"[DEBUG] {manual_dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
 
                 if ratio <= 3.0:
                     print(f"[INFO] CAMERA_DEVICE_ID로 지정된 컬러 카메라 사용: {manual_dev}")
+                    # 여기서는 cap을 유지한채로 바로 반환
                     idx = int(CAMERA_DEVICE_ID)
                     return cap, idx, manual_dev
 
@@ -254,6 +259,7 @@ def open_realsense_capture():
 
     # --------------------------------------------------
     # 3) 실제로 VideoCapture 열어서 프레임 테스트
+    #    (컬러 후보에서만 시도, 나머지는 아예 건드리지 않음 → timeout 지옥 방지)
     # --------------------------------------------------
     for dev in ordered_devs:
         print(f"[INFO] RealSense 후보 노드 테스트: {dev}")
@@ -274,7 +280,7 @@ def open_realsense_capture():
         ok_any = False
         frame = None
 
-        # timeout 방지를 위해 3번만 시도
+        # timeout 방지를 위해 너무 많이 시도하지 않고, 3번만 시도
         for _ in range(3):
             ret, f = cap.read()
             if ret and f is not None and f.size > 0:
@@ -318,11 +324,11 @@ def open_realsense_capture():
         print(f"[INFO] 사용 가능한 RealSense 컬러 카메라 확정: device='{dev}', index={idx}")
         return cap, idx, dev
 
+    # 여기까지 왔다는 건 "컬러 후보"들에서도 쓸만한 스트림을 찾지 못했다는 뜻
     raise RuntimeError(
         "[ERROR] RealSense 컬러 후보 /dev/video* 노드들 중 어떤 것도 유효한 컬러 프레임을 제공하지 않습니다.\n"
         "실제로 어떤 /dev/videoX가 컬러인지 v4l2-ctl 로 확인 후 CAMERA_DEVICE_ID를 설정해 주세요."
     )
-
 
 # ==========================
 # 1) 카메라 + 제스처 쓰레드 (제스처 freeze 기능 추가)
@@ -476,12 +482,12 @@ class GestureCamera(threading.Thread):
 
             # MediaPipe Hands는 RGB 입력
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            result = self._mp_hands.process(frame_rgb)
+            result = self._mp_hands.process(frame_rgb)            
             if result.multi_hand_landmarks:
                 print("[DEBUG] hand detected")
             else:
                 print("[DEBUG] no hand")
-
+          
             new_gesture = None  # 기본값: 이번 프레임에서는 새 제스처 없음
 
             if result.multi_hand_landmarks:
@@ -503,7 +509,7 @@ class GestureCamera(threading.Thread):
 
 
 # ==========================
-# 2) Gemini로 응답 받기 (액션 파싱 없이 그대로 출력용)
+# 2) Gemini로 액션 결정 (초기 gesture/instruction 사용)
 # ==========================
 
 def _normalize_gesture_for_prompt(gesture: str | None) -> str:
@@ -523,22 +529,24 @@ def _normalize_gesture_for_prompt(gesture: str | None) -> str:
     return "none"
 
 
-def query_gemini_response(client, model_name, frame_bgr, gesture, spoken_text):
+def query_gemini_action(client, model_name, frame_bgr, gesture, spoken_text):
     """
     - frame_bgr: 최신 카메라 RGB 관측 (BGR 포맷)
     - gesture : "turn right" / "turn left" / None (초기 제스처)
     - spoken_text: STT로 변환된 사람 발화 내용 (초기 instruction)
 
-    반환: full_text (Gemini가 생성한 전체 응답 문자열)
+    반환: (next_action, full_text)
+      - next_action ∈ ACTION_SPACE
+      - full_text  : Gemini가 생성한 전체 응답 문자열
     """
     if frame_bgr is None:
-        print("[WARN] frame_bgr가 None → LLM에 질의하지 않고 메시지 반환")
-        return "[LLM] no frame_bgr (skipped query)"
+        print("[WARN] frame_bgr가 None → 안전하게 'stop' 반환")
+        return "stop", "[LLM] no frame_bgr (returned 'stop')"
 
     ok, jpg = cv2.imencode(".jpg", frame_bgr)
     if not ok:
-        print("[ERROR] 이미지 JPEG 인코딩 실패 → LLM에 질의하지 않고 메시지 반환")
-        return "[LLM] jpeg encode failed (skipped query)"
+        print("[ERROR] 이미지 JPEG 인코딩 실패 → 'stop' 반환")
+        return "stop", "[LLM] jpeg encode failed (returned 'stop')"
 
     image_part = types.Part.from_bytes(
         data=jpg.tobytes(),
@@ -556,7 +564,9 @@ def query_gemini_response(client, model_name, frame_bgr, gesture, spoken_text):
     # 상세 정책은 prompt.txt에 포함되어 있음
     system_instruction = (
         "You are a navigation decision module for a mobile robot. "
-        "Follow the prompt instructions carefully and produce a detailed answer."
+        "You must follow the prompt instructions and finally choose ONE action "
+        "from this action_space: forward, left, right, stop, goal_signal. "
+        "In your answer, clearly state the final chosen action following the required format."
     )
 
     # --- 외부 텍스트 파일에서 템플릿 로드 ---
@@ -569,7 +579,11 @@ def query_gemini_response(client, model_name, frame_bgr, gesture, spoken_text):
         .replace("{gesture_str}", gesture_str)
     )
 
-    t0 = time.time()
+    # 디버그용: 프롬프트 앞부분만 잠깐 찍어보고 싶으면 주석 해제
+    # print("===== PROMPT HEAD =====")
+    # print(prompt[:400])
+    # print("=======================")
+
     response = client.models.generate_content(
         model=model_name,
         contents=[
@@ -578,11 +592,22 @@ def query_gemini_response(client, model_name, frame_bgr, gesture, spoken_text):
             prompt,
         ],
     )
-    t1 = time.time()
-    print(f"[PROFILE] Gemini (generate_content) took {t1 - t0:.3f} s")
 
     # 전체 텍스트
     full_text = (response.text or "").strip()
+    # full_lower = full_text.lower()
+
+    # # next_action 파싱: 맨 앞 토큰 기준 우선
+    # for action in ACTION_SPACE:
+    #     if full_lower.startswith(action):
+    #         return action, full_text
+
+    # # 그게 안 되면, 포함 여부라도 체크
+    # for action in ACTION_SPACE:
+    #     if action in full_lower:
+    #         return action, full_text
+
+    # 최후의 보루: stop
     return full_text
 
 
@@ -656,17 +681,18 @@ def main():
     print("\n[INFO] 초기 instruction + 제스처 확보 완료.")
     print("[INFO] 이후에는 마이크는 더 이상 사용하지 않고,")
     print("       6초마다 카메라 RGB + (초기 제스처, 초기 instruction)을 기반으로")
-    print("       Gemini에게 다음 응답을 질의합니다.\n")
+    print("       Gemini에게 다음 액션을 질의합니다.\n")
 
     # ==========================
-    # 3-2) 6초 주기로 카메라 뷰 기반 LLM 응답 출력
+    # 3-2) 6초 주기로 카메라 뷰 기반 next_action 업데이트
     # ==========================
     try:
         while True:
             frame_bgr = cam_thread.get_latest_frame()
             gesture_now = cam_thread.get_gesture()  # freeze 이후엔 항상 initial_gesture와 동일
 
-            llm_text = query_gemini_response(
+            # next_action과 전체 LLM 응답을 모두 받음
+            next_action, llm_text = query_gemini_action(
                 client=client,
                 model_name=GEMINI_MODEL_NAME,
                 frame_bgr=frame_bgr,
@@ -674,11 +700,16 @@ def main():
                 spoken_text=spoken_text_initial,
             )
 
-            print("\n[LLM REPLY] ==========================================")
+            print(f"[LOOP] 현재 제스처(실시간/동일): {gesture_now}")
+            print(f"[RESULT] instruction    : {spoken_text_initial}")
+            print(f"[RESULT] initial_gesture: {initial_gesture}")
+            print(f"[RESULT] next_action    : {next_action}")
+            print("[RESULT] full LLM reply --------------------------------")
             print(llm_text)
-            print("=======================================================")
+            print("--------------------------------------------------------")
+            print("-" * 60)
 
-            time.sleep(6.0)
+            #time.sleep(6.0)
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
