@@ -436,11 +436,18 @@ class GestureCamera(threading.Thread):
         """
         제스처를 한 번만 freeze.
         이후에는 _update_gesture에서 더 이상 값이 바뀌지 않음.
+        + MediaPipe Hands 인퍼런스도 완전히 중단.
         """
         with self._lock:
             if not self._gesture_frozen:
                 self._gesture_frozen = True
                 print(f"[GESTURE] 초기 제스처 freeze: {self._gesture}")
+                # 여기에서 MediaPipe 세션도 닫아버림
+                if self._mp_hands is not None:
+                    self._mp_hands.close()
+                    self._mp_hands = None
+                    print("[INFO] MediaPipe Hands 인퍼런스 중단 (세션 close)")
+
 
     def _update_gesture(self, new_gesture):
         """
@@ -513,14 +520,20 @@ class GestureCamera(threading.Thread):
             with self._lock:
                 self._latest_frame_bgr = frame_bgr
 
-            # 제스처가 이미 freeze 되었더라도, 카메라 프레임은 계속 갱신해야 함
-            if self._gesture_frozen:
+            # --------- 여기부터: gesture freeze 이후에는 MediaPipe 완전 정지 ---------
+            with self._lock:
+                gesture_frozen = self._gesture_frozen
+                mp_hands = self._mp_hands
+
+            if gesture_frozen or mp_hands is None:
+                # 더 이상 손 제스처는 보지 않고, 프레임만 갱신
                 time.sleep(0.03)
                 continue
+            # -----------------------------------------------------------------------
 
             # MediaPipe Hands는 RGB 입력
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            result = self._mp_hands.process(frame_rgb)
+            result = mp_hands.process(frame_rgb)
             if result.multi_hand_landmarks:
                 print("[DEBUG] hand detected")
             else:
@@ -542,9 +555,9 @@ class GestureCamera(threading.Thread):
             time.sleep(0.03)
 
         self.cap.release()
-        self._mp_hands.close()
+        if self._mp_hands is not None:
+            self._mp_hands.close()
         print("[INFO] GestureCamera 쓰레드 종료")
-
 
 # ==========================
 # 2) VLM로 액션 결정 (초기 gesture/instruction 사용)
