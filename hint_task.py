@@ -155,6 +155,9 @@ def open_realsense_capture():
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         ret, frame = cap.read()
+        print("shape:", frame.shape, "dtype:", frame.dtype)
+        cv2.imwrite("./debug_first_frame.jpg", frame)
+        cap.release()
         if not ret or frame is None or frame.size == 0:
             print(f"[WARN] {dev} 에서 유효한 프레임을 읽지 못했습니다.")
             cap.release()
@@ -331,13 +334,18 @@ class GestureCamera(threading.Thread):
 
             # MediaPipe Hands는 RGB 입력
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            result = self._mp_hands.process(frame_rgb)
-
+            result = self._mp_hands.process(frame_rgb)            
+            if result.multi_hand_landmarks:
+                print("[DEBUG] hand detected")
+            else:
+                print("[DEBUG] no hand")
+          
             new_gesture = None  # 기본값: 이번 프레임에서는 새 제스처 없음
 
             if result.multi_hand_landmarks:
                 hand_lms = result.multi_hand_landmarks[0]
                 g = self._infer_gesture_from_hand(hand_lms)
+                print("[DEBUG] inferred gesture:", g)
                 if g is not None:
                     new_gesture = g
 
