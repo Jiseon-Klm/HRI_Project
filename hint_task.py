@@ -66,10 +66,22 @@ def load_prompt_template(path: str = "prompt.txt") -> str:
 # ==========================
 def open_realsense_capture():
     """
-    RealSense를 자동 탐색하되,
-    - v4l2-ctl --list-formats-ext 로 픽셀 포맷을 확인해서
-      '컬러 스트림 가능성이 높은 /dev/videoX'를 먼저 시도한다.
-    - 대표적으로 MJPG, YUYV, RGB3, BGR3 등을 컬러 후보로 본다.
+    RealSense 카메라를 robust하게 여는 함수.
+
+    1) config.CAMERA_DEVICE_ID 가 설정되어 있으면:
+       - /dev/video{CAMERA_DEVICE_ID} 를 먼저 시도하고,
+       - 성공하면 바로 반환.
+       - 실패하면 경고만 찍고 2) 자동 탐색으로 fallback.
+
+    2) 자동 탐색:
+       - `v4l2-ctl --list-devices` 에서 RealSense 블록만 모은 뒤
+       - 각 /dev/videoX 에 대해 `--list-formats-ext` 로 포맷을 보고
+         MJPG, YUYV, RGB3, BGR3 등이 있으면 "컬러 후보"로 점수 부여.
+       - 컬러 후보(dev_score > 0)만 우선 시도한다.
+       - 컬러 후보 중에서만 "멀쩡한 컬러 프레임"이 나오면 그걸 사용.
+       - 컬러 후보에서도 아무것도 못 찾으면,
+         더 이상 다른 /dev/videoX들(0,1,2,3,5...)을 억지로 시도하지 않고
+         RuntimeError로 빠르게 실패한다. (timeout 지옥 방지)
 
     반환: (cap, index, dev_path)
       - cap      : 열린 cv2.VideoCapture (release 하지 않은 상태)
@@ -78,6 +90,63 @@ def open_realsense_capture():
     """
     print("[INFO] RealSense 카메라 자동 탐색: `v4l2-ctl --list-devices` 실행")
 
+    # --------------------------------------------------
+    # 0) 사용자가 CAMERA_DEVICE_ID를 지정해둔 경우 우선 사용
+    # --------------------------------------------------
+    if CAMERA_DEVICE_ID is not None:
+        manual_dev = f"/dev/video{CAMERA_DEVICE_ID}"
+        print(f"[INFO] config.CAMERA_DEVICE_ID={CAMERA_DEVICE_ID} -> {manual_dev} 우선 시도")
+
+        cap = cv2.VideoCapture(manual_dev)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            except Exception:
+                pass
+
+            # 짧게 몇 프레임만 확인
+            ok_any = False
+            frame = None
+            for _ in range(3):
+                ret, f = cap.read()
+                if ret and f is not None and f.size > 0:
+                    frame = f
+                    ok_any = True
+                    break
+                time.sleep(0.05)
+
+            if ok_any and frame is not None and len(frame.shape) == 3 and frame.shape[2] == 3:
+                b_mean = float(frame[:, :, 0].mean())
+                g_mean = float(frame[:, :, 1].mean())
+                r_mean = float(frame[:, :, 2].mean())
+                channel_means = (b_mean, g_mean, r_mean)
+                max_mean = max(channel_means)
+                min_mean = max(min(channel_means), 1e-3)
+                ratio = max_mean / min_mean
+                print(f"[DEBUG] {manual_dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
+
+                if ratio <= 3.0:
+                    print(f"[INFO] CAMERA_DEVICE_ID로 지정된 컬러 카메라 사용: {manual_dev}")
+                    # 여기서는 cap을 유지한채로 바로 반환
+                    idx = int(CAMERA_DEVICE_ID)
+                    return cap, idx, manual_dev
+
+                else:
+                    print(f"[WARN] {manual_dev} 는 컬러 채널이 한쪽에 치우침 (ratio={ratio:.2f}) -> 무시하고 자동 탐색으로 이동")
+                    cap.release()
+            else:
+                print(f"[WARN] {manual_dev} 에서 유효한 프레임을 얻지 못함 -> 자동 탐색으로 이동")
+                cap.release()
+        else:
+            print(f"[WARN] {manual_dev} 를 열 수 없음 (isOpened()==False) -> 자동 탐색으로 이동")
+            cap.release()
+
+    # --------------------------------------------------
+    # 1) `v4l2-ctl --list-devices` 로 RealSense 블록 찾기
+    # --------------------------------------------------
     try:
         proc = subprocess.run(
             ["v4l2-ctl", "--list-devices"],
@@ -97,7 +166,6 @@ def open_realsense_capture():
 
     for line in lines:
         if not line.strip():
-            # 빈 줄 → 이전 블록 종료
             if current_name is not None:
                 devices_info.append((current_name, list(current_devices)))
             current_name = None
@@ -105,22 +173,18 @@ def open_realsense_capture():
             continue
 
         if not line.startswith("\t") and not line.startswith(" "):
-            # 새 장치 이름 라인
             if current_name is not None:
                 devices_info.append((current_name, list(current_devices)))
             current_name = line.strip().rstrip(":")
             current_devices = []
         else:
-            # /dev/videoX 라인
             dev_path = line.strip()
             if dev_path.startswith("/dev/video"):
                 current_devices.append(dev_path)
 
-    # 마지막 블록 처리
     if current_name is not None:
         devices_info.append((current_name, list(current_devices)))
 
-    # RealSense 관련 블록만 필터링
     rs_blocks = [(name, devs) for name, devs in devices_info if "realsense" in name.lower()]
 
     if not rs_blocks:
@@ -129,7 +193,6 @@ def open_realsense_capture():
             "RealSense가 /dev/video* 로 제대로 잡혀 있는지 확인하세요."
         )
 
-    # RealSense 블록 내 모든 /dev/video* 후보 수집
     candidate_devs = []
     for name, devs in rs_blocks:
         print(f"[DEBUG] RealSense block: '{name}' -> {devs}")
@@ -140,9 +203,11 @@ def open_realsense_capture():
             "[ERROR] RealSense 장치는 있으나 /dev/video* 노드를 찾지 못했습니다."
         )
 
-    # ---- 1단계: v4l2-ctl --list-formats-ext 로 "컬러 후보" 점수 매기기 ----
+    # --------------------------------------------------
+    # 2) v4l2-ctl --list-formats-ext 로 "컬러 후보"만 점수 매기기
+    # --------------------------------------------------
     color_keywords = ("mjpg", "yuyv", "rgb3", "bgr3")
-    dev_score = {}  # dev_path -> score (높을수록 컬러일 확률 ↑)
+    dev_score = {}  # dev_path -> score
 
     for dev in candidate_devs:
         try:
@@ -167,16 +232,28 @@ def open_realsense_capture():
         dev_score[dev] = score
         print(f"[DEBUG] {dev} pixel-format score={score}")
 
-    # 컬러 후보(dev_score가 큰 dev)를 먼저 시도하도록 정렬
+    # 점수 > 0 인 dev만 "컬러 후보"
+    color_candidates = [d for d in candidate_devs if dev_score.get(d, 0) > 0]
+
+    if not color_candidates:
+        raise RuntimeError(
+            "[ERROR] RealSense /dev/video* 노드에서 컬러 포맷(MJPG/YUYV/RGB3/BGR3)을 찾지 못했습니다.\n"
+            "v4l2-ctl -d /dev/videoX --list-formats-ext 를 직접 확인한 뒤 CAMERA_DEVICE_ID를 수동 설정하는 걸 추천합니다."
+        )
+
+    # 점수 높은 순으로 시도
     ordered_devs = sorted(
-        candidate_devs,
+        color_candidates,
         key=lambda d: dev_score.get(d, 0),
         reverse=True,
     )
 
-    print(f"[DEBUG] RealSense dev 시도 순서: {ordered_devs}")
+    print(f"[DEBUG] RealSense 컬러 후보 dev 시도 순서: {ordered_devs}")
 
-    # ---- 2단계: 실제로 VideoCapture 열어서 프레임 테스트 ----
+    # --------------------------------------------------
+    # 3) 실제로 VideoCapture 열어서 프레임 테스트
+    #    (컬러 후보에서만 시도, 나머지는 아예 건드리지 않음 → timeout 지옥 방지)
+    # --------------------------------------------------
     for dev in ordered_devs:
         print(f"[INFO] RealSense 후보 노드 테스트: {dev}")
         cap = cv2.VideoCapture(dev)
@@ -185,7 +262,6 @@ def open_realsense_capture():
             cap.release()
             continue
 
-        # 해상도 / 포맷 설정 (가능하면 MJPG로 강제)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         try:
@@ -194,10 +270,11 @@ def open_realsense_capture():
         except Exception:
             pass
 
-        # 프레임 여러 장 읽어서 안정성 확인
         ok_any = False
         frame = None
-        for _ in range(5):
+
+        # timeout 방지를 위해 너무 많이 시도하지 않고, 3번만 시도
+        for _ in range(3):
             ret, f = cap.read()
             if ret and f is not None and f.size > 0:
                 frame = f
@@ -210,9 +287,6 @@ def open_realsense_capture():
             cap.release()
             continue
 
-        # 간단한 컬러 sanity check:
-        #  - 3채널인지
-        #  - B/G/R 채널 평균값이 한 채널만 압도적으로 크지 않은지
         if len(frame.shape) != 3 or frame.shape[2] != 3:
             print(f"[WARN] {dev} 프레임이 3채널이 아님: shape={frame.shape}")
             cap.release()
@@ -223,18 +297,16 @@ def open_realsense_capture():
         r_mean = float(frame[:, :, 2].mean())
         channel_means = (b_mean, g_mean, r_mean)
         max_mean = max(channel_means)
-        min_mean = max(min(channel_means), 1e-3)  # 0으로 나누기 방지
+        min_mean = max(min(channel_means), 1e-3)
         ratio = max_mean / min_mean
 
         print(f"[DEBUG] {dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
 
-        # 너무 한 채널만 튀면 (ex. 초록색 화면) 컬러가 아니라 Bayer/raw로 판단하고 패스
         if ratio > 3.0:
             print(f"[WARN] {dev} 프레임이 한 채널에 강하게 치우침 → 컬러 스트림 아님으로 판단하고 패스")
             cap.release()
             continue
 
-        # 여기까지 왔으면 "쓸만한 컬러 스트림"으로 간주
         m = re.search(r"/dev/video(\d+)", dev)
         if not m:
             print(f"[WARN] {dev} 의 인덱스를 파싱하지 못했습니다.")
@@ -243,15 +315,13 @@ def open_realsense_capture():
 
         idx = int(m.group(1))
         print(f"[INFO] 사용 가능한 RealSense 컬러 카메라 확정: device='{dev}', index={idx}")
-        # !!! 여기서는 더 이상 cap.release() 하지 않는다 !!!
         return cap, idx, dev
 
-    # 아무 dev도 통과하지 못한 경우
+    # 여기까지 왔다는 건 "컬러 후보"들에서도 쓸만한 스트림을 찾지 못했다는 뜻
     raise RuntimeError(
-        "[ERROR] RealSense /dev/video* 노드 중 컬러 스트림을 찾지 못했습니다.\n"
-        "v4l2-ctl --list-formats-ext 로 각 노드의 포맷을 직접 확인해보세요."
+        "[ERROR] RealSense 컬러 후보 /dev/video* 노드들 중 어떤 것도 유효한 컬러 프레임을 제공하지 않습니다.\n"
+        "실제로 어떤 /dev/videoX가 컬러인지 v4l2-ctl 로 확인 후 CAMERA_DEVICE_ID를 설정해 주세요."
     )
-
 
 # ==========================
 # 1) 카메라 + 제스처 쓰레드 (제스처 freeze 기능 추가)
