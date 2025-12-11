@@ -34,6 +34,8 @@ from config import (
     # GEMINI_MODEL_NAME # 더 이상 사용 안 함
 )
 
+from dotenv import load_dotenv
+load_dotenv()
 # protobuf deprecation warning 숨기기 (STT나 다른 모듈에서 나오는 경고 방지용)
 warnings.filterwarnings(
     "ignore",
@@ -645,7 +647,7 @@ def query_gemini_action(client, model_name, frame_bgr, gesture, spoken_text):
             ),
         },
     ]
-
+    
     t0 = time.time()
     resp = client.responses.create(
         model=model_name,   # ex) "gpt-5"
