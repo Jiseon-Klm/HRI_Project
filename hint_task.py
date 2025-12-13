@@ -43,7 +43,6 @@ warnings.filterwarnings(
 # LLM이 최종적으로 선택해야 하는 액션 공간
 # prompt.txt와 정확히 동일한 토큰을 사용해야 파싱이 잘 됨
 ACTION_SPACE = ["forward", "left", "right", "stop", "goal"]
-os.environ["OPENAI_API_KEY"] = ""
 
 # 프롬프트 템플릿 캐시용 전역 변수
 PROMPT_TEMPLATE: str | None = None
@@ -664,7 +663,7 @@ def main():
         print("[FATAL] RealSense 카메라를 찾을 수 없어 종료합니다.")
         return
     load_dotenv()
-    client = OpenAI()
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
     # 1) 제스처 카메라 쓰레드 시작 (이미 열린 cap을 넘김)
     cam_thread = GestureCamera(cap=cap)
