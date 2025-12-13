@@ -22,6 +22,7 @@ import os
 import cv2
 import mediapipe as mp
 import numpy as np
+import base64
 
 from openai import OpenAI
 
@@ -544,7 +545,19 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
         return "stop", "[LLM] no frame_bgr (returned 'stop')"
 
     try:
-        data_url = _encode_frame_to_data_url(frame_bgr)
+        if frame_bgr is None:
+            raise RuntimeError("frame_bgr is None")
+        
+        frame_bgr = np.ascontiguousarray(frame_bgr, dtype=np.uint8)
+        ok, buf = cv2.imencode(
+            ".jpg",
+            frame_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+        )
+        if not ok:
+            raise RuntimeError("cv2.imencode failed")
+        
+        data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
     except Exception as e:
         print(f"[ERROR] 이미지 인코딩 실패 ({e}) → 'stop' 반환")
         return "stop", "[LLM] jpeg encode failed (returned 'stop')"
@@ -658,9 +671,6 @@ def main():
     # 2) STT 준비 (ReSpeaker 입력, 초기 한 번만 사용)
     stt = STTProcessor()
 
-    # 3) Gemini 클라이언트 준비
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
     dummy_volume = DummyVolumeSignal()
 
     # ==========================
@@ -730,7 +740,7 @@ def main():
             print(llm_text)
             print("--------------------------------------------------------")
             print("-" * 60)
-
+            i+=1
             time.sleep(6.0)
 
     except KeyboardInterrupt:
