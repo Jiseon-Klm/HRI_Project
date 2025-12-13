@@ -595,7 +595,7 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
                 {
                     "role": "system",
                     "content": [
-                        {"type": "text", "text": system_instruction}
+                        {"type": "input_text", "text": system_instruction}
                     ],
                 },
                 {
