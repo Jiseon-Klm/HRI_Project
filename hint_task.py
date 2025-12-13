@@ -18,7 +18,7 @@ import time
 import subprocess
 import re
 import os
-
+from dotenv import load_dotenv
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -662,6 +662,7 @@ def main():
         print(e)
         print("[FATAL] RealSense 카메라를 찾을 수 없어 종료합니다.")
         return
+    load_dotenv()
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
     # 1) 제스처 카메라 쓰레드 시작 (이미 열린 cap을 넘김)
