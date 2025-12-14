@@ -153,14 +153,25 @@ class STTProcessor:
         except Exception:
             pass
 
+        # cmd = [
+        #     "arecord",
+        #     "-D",
+        #     self.alsa_device,
+        #     "-f",
+        #     "cd",
+        #     "-d",
+        #     str(duration_sec),
+        #     OUTPUT_FILE,
+        # ]
+
         cmd = [
             "arecord",
-            "-D",
-            self.alsa_device,
-            "-f",
-            "cd",
-            "-d",
-            str(duration_sec),
+            "-D", self.alsa_device,          # plughw:card,dev
+            "-t", "wav",
+            "-f", "S16_LE",
+            "-c", "1",
+            "-r", str(SAMPLE_RATE),          # config.py의 16000
+            "-d", str(duration_sec),
             OUTPUT_FILE,
         ]
 
@@ -180,6 +191,9 @@ class STTProcessor:
             return None
 
         print(f"[INFO] 녹음 완료: {OUTPUT_FILE}")
+        data, sr = sf.read(OUTPUT_FILE)
+        print("[DEBUG] wav sr/ch:", sr, data.shape)
+        print("[DEBUG] rms:", float(np.sqrt(np.mean(np.square(data)))))
         return OUTPUT_FILE
 
     def transcribe(self, audio_file):
