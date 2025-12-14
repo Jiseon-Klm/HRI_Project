@@ -1,30 +1,23 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import subprocess
 import threading
 import time
 import re
-import math
-from collections import deque
-from typing import Optional, Tuple
 
-import whisper  # STT
+import whisper                         # ✅ STT용 Whisper
+from transformers import VitsModel, AutoTokenizer
+import sounddevice as sd               # (TTS에서만 사용)
 import numpy as np
 import soundfile as sf
+import torch
 
-# (프로젝트에서 쓰고 있던 것들 - STT만 쓸 때 미사용이어도 import 유지)
-from transformers import VitsModel, AutoTokenizer  # noqa: F401
-import torch  # noqa: F401
-import sounddevice as sd  # noqa: F401  # TTS에서만 쓴다고 했으니 유지(원하면 삭제 가능)
-from google import genai  # noqa: F401
+from google import genai
 
 from config import (
     SAMPLE_RATE,
     BLOCK_DURATION,
     SILENCE_DURATION,
     OUTPUT_FILE,
-    MODEL_NAME,
+    MODEL_NAME,          # ✅ 이거 꼭 필요
     LANG,
     GEMINI_API_KEY,
     GEMINI_MODEL_NAME,
@@ -33,53 +26,49 @@ from config import (
     MMS_TTS_MODEL_ID,
     MMS_TTS_OUTPUT_FILE,
 )
-
-
 # ================== STT (Speech-to-Text) ==================
 
 class STTProcessor:
     """
-    arecord(=ALSA direct) 기반 VAD + Whisper STT
-
-    핵심 의도:
-    - 버전1에서 정상 동작하던 ALSA 디바이스(plughw:card,dev)를 그대로 사용
-    - sounddevice/PortAudio 매핑을 STT 경로에서 제거해서
-      "열리긴 열리는데 무음(0)" 이슈를 원천 차단
+    - 처음 생성될 때 `arecord -l` 결과에서
+      'ReSpeaker 4 Mic Array (UAC1.0)'가 있는 card/device를 자동으로 찾는다.
+    - 이후 listen_once()를 부르면
+      arecord -D plughw:{card},{device} -f cd -d {duration_sec} OUTPUT_FILE
+      로 WAV를 녹음한 뒤 Whisper STT 수행.
     """
 
-    def __init__(self):
+    def __init__(self, record_duration_sec: int = 5):
         print("[INFO] Whisper 모델 로딩 중...")
         self.whisper_model = whisper.load_model(MODEL_NAME)
         print("[INFO] 모델 로드 완료.")
 
+        self.record_duration_sec = record_duration_sec
         self.interrupt_event = threading.Event()
 
-        # 1) ReSpeaker ALSA card/device 자동 탐지
+        # ReSpeaker ALSA card/device 자동 탐지
         self.card_number, self.device_number = self._detect_respeaker_card_device()
         self.alsa_device = f"plughw:{self.card_number},{self.device_number}"
         print(f"[INFO] Detected ReSpeaker ALSA device: {self.alsa_device}")
 
-        # 2) STT는 mono로 처리 (필요하면 나중에 4ch도 가능하지만 VAD 안정성이 우선)
-        self.channels = 1
-        print(f"[INFO] STT input channels (forced): {self.channels}")
-
-        # 3) 배경 소음 측정 -> threshold 설정
-        self.base_noise = self._measure_noise_level(duration=1.0)
-        self.base_noise = max(self.base_noise, 1e-4)  # 너무 작으면 오탐/불안정
-
-        self.silence_threshold = self.base_noise * 3.5
-        print(f"[INFO] base_noise(RMS)={self.base_noise:.6f}, silence_threshold={self.silence_threshold:.6f}")
-
     def request_interrupt(self):
-        """외부에서 STT 대기를 끊고 싶을 때 사용"""
+        """
+        옛날 sounddevice 기반 VAD 인터페이스와 호환용.
+        지금 구조에서는 arecord를 동기 호출하므로 별도 중단은 구현 안 했고,
+        그냥 플래그만 세팅해둠.
+        """
         self.interrupt_event.set()
 
-    # -------------------------
-    # ALSA device detect (arecord -l)
-    # -------------------------
-    def _detect_respeaker_card_device(self) -> Tuple[int, int]:
+    def _detect_respeaker_card_device(self):
         """
-        arecord -l 출력에서 ReSpeaker로 보이는 card/device를 추출
+        arecord -l 출력 예:
+
+        card 1: ArrayUAC10 [ReSpeaker 4 Mic Array (UAC1.0)], device 0: USB Audio [USB Audio]
+          Subdevices: 1/1
+          Subdevice #0: subdevice #0
+        card 3: Generic_1 [HD-Audio Generic], device 0: ALC1220 Analog [ALC1220 Analog]
+
+        여기서 'ReSpeaker', 'ArrayUAC10', 'Mic Array', 'USB Audio' 같은 키워드가
+        포함된 라인에서 card / device 번호를 뽑는다.
         """
         print("[INFO] ReSpeaker ALSA 디바이스 자동 탐색: `arecord -l` 실행")
 
@@ -110,6 +99,7 @@ class STTProcessor:
             if not line.startswith("card "):
                 continue
 
+            # ReSpeaker 관련 키워드가 포함된 card 라인만 필터링
             if not any(kw in line for kw in preferred_keywords):
                 continue
 
@@ -123,242 +113,70 @@ class STTProcessor:
                 break
 
         if candidate is None:
+            # 진짜 ReSpeaker가 안 붙어 있으면 여기서 에러
             raise RuntimeError(
                 "[ERROR] `arecord -l` 출력에서 ReSpeaker 디바이스를 찾지 못했습니다.\n"
-                "1) ReSpeaker 연결 확인\n"
-                "2) 컨테이너면 /dev/snd 마운트 확인\n"
-                "3) `arecord -l` 출력에 ReSpeaker 관련 라인이 있는지 확인"
+                "ReSpeaker가 제대로 연결되어 있는지, 컨테이너에 /dev/snd 가 마운트되어 있는지,\n"
+                "`arecord -l` 출력에 'ReSpeaker 4 Mic Array (UAC1.0)' 가 보이는지 확인하세요."
             )
 
         return candidate
 
-    # -------------------------
-    # arecord raw stream
-    # -------------------------
-    def _arecord_raw_stream(self, rate: int, channels: int) -> subprocess.Popen:
+    def listen_once(self, volume_level_changed, duration_sec: int | None = None):
         """
-        arecord로 raw PCM(S16_LE) 스트림을 stdout으로 받는다.
+        - arecord를 사용해서 지정된 ALSA 디바이스에서 고정 길이 녹음.
+        - duration_sec가 None이면 self.record_duration_sec 사용.
+        - 녹음이 끝나면 OUTPUT_FILE 경로를 반환.
         """
-        cmd = [
-            "arecord",
-            "-D", self.alsa_device,
-            "-q",                 # quiet
-            "-f", "S16_LE",        # 16-bit little endian
-            "-r", str(rate),
-            "-c", str(channels),
-            "-t", "raw",           # raw PCM to stdout
-        ]
-        # stderr는 디버깅 위해 PIPE로 받되, read로 막히지 않게 주의
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if duration_sec is None:
+            duration_sec = self.record_duration_sec
 
-    def _terminate_proc(self, p: subprocess.Popen):
+        # 인터럽트 플래그 초기화
+        self.interrupt_event.clear()
+
+        print(
+            f"[INFO] arecord 시작: device={self.alsa_device}, "
+            f"duration={duration_sec}s, file={OUTPUT_FILE}"
+        )
+
+        # 볼륨 미터용 신호는 여기선 제대로 계산 못 하니 0으로 한 번 쏴줌
         try:
-            if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=1.0)
-                except Exception:
-                    p.kill()
+            volume_level_changed.emit(0, 0.0)
         except Exception:
             pass
 
-    # -------------------------
-    # Noise measure (arecord 기반)
-    # -------------------------
-    def _measure_noise_level(self, duration: float = 1.0) -> float:
-        print("[INFO] 배경 소음 측정 중...(arecord raw)")
-        p = self._arecord_raw_stream(rate=SAMPLE_RATE, channels=1)
+        cmd = [
+            "arecord",
+            "-D",
+            self.alsa_device,
+            "-f",
+            "cd",
+            "-d",
+            str(duration_sec),
+            OUTPUT_FILE,
+        ]
 
         try:
-            if p.stdout is None:
-                print("[WARN] arecord stdout is None -> base_noise=0")
-                return 0.0
-
-            n_samples = int(SAMPLE_RATE * duration)
-            n_bytes = n_samples * 2  # int16
-
-            raw = p.stdout.read(n_bytes)
-            if not raw:
-                print("[WARN] raw audio empty -> base_noise=0")
-                return 0.0
-
-            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = float(np.sqrt(np.mean(audio ** 2)))
-            print(f"[INFO] 배경 RMS: {rms:.6f}")
-            return rms
-
-        finally:
-            self._terminate_proc(p)
-
-    # -------------------------
-    # VAD listen (arecord 기반)
-    # -------------------------
-    def listen_once_vad(
-        self,
-        volume_level_changed,
-        on_speech_start=None,
-        on_speech_end=None,
-        max_wait_sec: float = 60.0,
-        max_record_sec: float = 20.0,
-        debug_rms: bool = False,   # <==== 필요하면 True로 켜서 RMS 확인
-    ) -> Optional[str]:
-        """
-        말 시작/끝 자동 감지로 한 번 발화만 녹음해서 OUTPUT_FILE로 저장하고 경로 반환.
-        - 입력: arecord raw (S16_LE)
-        - 말 시작: avg_rms > START_THRESHOLD
-        - 말 끝  : avg_rms < silence_threshold 상태가 SILENCE_DURATION 이상 지속
-        """
-        self.interrupt_event.clear()
-
-        START_THRESHOLD = self.silence_threshold * 1.6
-        MIN_DURATION = 0.6
-
-        block_samples = int(SAMPLE_RATE * BLOCK_DURATION)
-        block_bytes = block_samples * 2  # int16
-
-        recorded = []
-        rms_buffer = deque(maxlen=10)
-
-        started = False
-        t0 = time.time()
-        start_time = None
-        last_sound_time = None
-
-        p = self._arecord_raw_stream(rate=SAMPLE_RATE, channels=1)
-
-        try:
-            if p.stdout is None:
-                print("[ERROR] arecord stdout is None (stream not available)")
-                return None
-
-            while True:
-                if self.interrupt_event.is_set():
-                    print("[INFO] STT listen_once_vad 인터럽트 → 중단")
-                    return None
-
-                if (time.time() - t0) > max_wait_sec and (not started):
-                    print("[WARN] 말 시작 대기 timeout")
-                    return None
-
-                if started and start_time is not None and (time.time() - start_time) > max_record_sec:
-                    print("[WARN] max_record_sec 도달 → 강제 종료")
-                    break
-
-                raw = p.stdout.read(block_bytes)
-                if not raw:
-                    # 프로세스가 죽었는지 체크
-                    if p.poll() is not None:
-                        err = ""
-                        try:
-                            if p.stderr is not None:
-                                err = p.stderr.read().decode("utf-8", errors="ignore")
-                        except Exception:
-                            pass
-                        print("[ERROR] arecord 종료됨 / raw read 실패")
-                        if err.strip():
-                            print("[ERROR] arecord stderr:\n" + err)
-                        return None
-                    continue
-
-                block = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                rms = float(np.sqrt(np.mean(block ** 2)))
-                rms_buffer.append(rms)
-                avg_rms = float(np.mean(rms_buffer))
-
-                if debug_rms:
-                    print(f"[DEBUG] rms={rms:.6f} avg={avg_rms:.6f} start_th={START_THRESHOLD:.6f} sil_th={self.silence_threshold:.6f}")
-
-                # 볼륨 표시 (UI용)
-                try:
-                    db = 20.0 * math.log10(rms + 1e-8)
-                    level = int(np.clip((db + 60.0) / 60.0 * 100.0, 0, 100))
-                    volume_level_changed.emit(level, db + 50.0)
-                except Exception:
-                    pass
-
-                # ---- 말 시작 감지 ----
-                if not started:
-                    if avg_rms > START_THRESHOLD:
-                        started = True
-                        start_time = time.time()
-                        last_sound_time = start_time
-                        print("[INFO] VAD: speech start")
-
-                        if callable(on_speech_start):
-                            try:
-                                on_speech_start()
-                            except Exception as e:
-                                print(f"[WARN] on_speech_start callback error: {e}")
-
-                        recorded.append(block.copy())
-                    continue
-
-                # ---- 녹음 중 ----
-                recorded.append(block.copy())
-
-                # 마지막 소리 시점 갱신/종료 조건 체크
-                if avg_rms > self.silence_threshold:
-                    last_sound_time = time.time()
-                else:
-                    now = time.time()
-                    if (
-                        last_sound_time is not None
-                        and (now - last_sound_time > SILENCE_DURATION)
-                        and (start_time is not None)
-                        and (now - start_time > MIN_DURATION)
-                    ):
-                        print("[INFO] VAD: speech end")
-
-                        if callable(on_speech_end):
-                            try:
-                                on_speech_end()
-                            except Exception as e:
-                                print(f"[WARN] on_speech_end callback error: {e}")
-                        break
-
-        finally:
-            self._terminate_proc(p)
-
-        if not recorded:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+            # 필요하면 proc.stdout 로그 찍어서 디버깅 가능
+            # print(proc.stdout)
+        except subprocess.CalledProcessError as e:
+            print("[ERROR] arecord 실행 실패:")
+            print(e.stdout)
             return None
 
-        audio = np.concatenate(recorded, axis=0).astype(np.float32)
-        audio_i16 = np.int16(np.clip(audio, -1.0, 1.0) * 32767)
-
-        sf.write(OUTPUT_FILE, audio_i16, SAMPLE_RATE, subtype="PCM_16", format="WAV")
-        print(f"[INFO] 녹음 완료(VAD/arecord): {OUTPUT_FILE}")
+        print(f"[INFO] 녹음 완료: {OUTPUT_FILE}")
         return OUTPUT_FILE
 
-    def transcribe(self, audio_file: str) -> str:
+    def transcribe(self, audio_file):
         print(f"[INFO] '{audio_file}' STT 처리 중...")
         result = self.whisper_model.transcribe(audio_file, language=LANG, fp16=False)
-        text = (result.get("text", "") or "").strip()
+        text = result["text"].strip()
         print(f"[INFO] STT 결과: {text}")
         return text
-
-    def listen_and_transcribe_once(
-        self,
-        volume_level_changed,
-        on_speech_start=None,
-        on_speech_end=None,
-        debug_rms: bool = False,
-    ) -> str:
-        """
-        한 번 호출로:
-        - VAD로 말 시작/끝까지 녹음
-        - Whisper로 STT
-        """
-        audio_path = self.listen_once_vad(
-            volume_level_changed=volume_level_changed,
-            on_speech_start=on_speech_start,
-            on_speech_end=on_speech_end,
-            debug_rms=debug_rms,
-        )
-        if audio_path is None:
-            return ""
-        return self.transcribe(audio_file=audio_path).strip()
-
-
-# ================== (선택) TTS / 기타 클래스들 ==================
-# 너 원본 llm_stt_tts.py에 TTSProcessor, Piper/MMS TTS 로직이 있었다면
-# 아래에 그대로 유지하면 돼. (STT는 위 STTProcessor만 쓰면 됨)
