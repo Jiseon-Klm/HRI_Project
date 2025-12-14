@@ -66,6 +66,32 @@ def load_prompt_template(path: str = "prompt.txt") -> str:
     print(f"[INFO] Gemini 프롬프트 템플릿 로드: {path}")
     return PROMPT_TEMPLATE
 
+def _is_rgb_v4l2_node(dev: str) -> bool:
+    """
+    v4l2-ctl -D 출력의 card/driver/bus_info 등을 보고
+    RGB/Color 카메라 노드인지 판정.
+    """
+    try:
+        p = subprocess.run(
+            ["v4l2-ctl", "-d", dev, "-D"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
+        out = p.stdout.lower()
+    except Exception:
+        return False
+
+    # RealSense 노드 이름엔 보통 'RGB Camera' / 'Depth Camera' / 'IR Camera' 같은 문자열이 들어가요.
+    positive = ("rgb", "color")
+    negative = ("ir", "depth", "stereo", "imu", "metadata")
+
+    has_pos = any(k in out for k in positive)
+    has_neg = any(k in out for k in negative)
+
+    return has_pos and (not has_neg)
+
 
 # ==========================
 # 0) RealSense 카메라 열기
@@ -255,6 +281,12 @@ def open_realsense_capture():
     )
 
     print(f"[DEBUG] RealSense 컬러 후보 dev 시도 순서: {ordered_devs}")
+    rgb_only = [d for d in ordered_devs if _is_rgb_v4l2_node(d)]
+    if rgb_only:
+        ordered_devs = rgb_only
+        print(f"[DEBUG] RGB/Color로 판정된 dev만 사용: {ordered_devs}")
+    else:
+        print("[WARN] v4l2-ctl -D에서 RGB/Color 노드를 특정 못했어요. 기존 후보로 계속 진행해요.")
 
     # --------------------------------------------------
     # 3) 실제로 VideoCapture 열어서 프레임 테스트
