@@ -88,12 +88,8 @@ def main():
                     "response": "",  # 나중에 수동 라벨링
                     "images": images,
                     "meta": {
-                        "traj_idx": traj_idx,
                         "instruction": instruction,
                         "gesture": gesture,
-                        "hz": hz,
-                        "k": K,
-                        "timestamps": [m.t for m in buf],
                     },
                 }
 
