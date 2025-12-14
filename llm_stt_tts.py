@@ -127,7 +127,7 @@ class STTProcessor:
         volume_level_changed,
         duration_sec: int | None = None,   # <- 인터페이스 유지 (hint_task.py 수정 최소화)
         silence_threshold: float = 0.01,   # RMS 임계값 (환경 따라 튜닝)
-        max_duration: float = 8.0,         # 최장 녹음 시간(초) - 무한 대기 방지
+        max_duration: float = 30.0,         # 최장 녹음 시간(초) - 무한 대기 방지
         min_speech_sec: float = 0.25,      # 이만큼은 말해야 "발화로 인정"
     ):
         """
@@ -176,8 +176,8 @@ class STTProcessor:
             except Exception:
                 pass
     
-            audio_chunks.append(indata.copy())
-    
+            if speaking:
+                audio_chunks.append(indata.copy())
             if rms >= silence_threshold:
                 speaking = True
                 speech_time += BLOCK_DURATION
