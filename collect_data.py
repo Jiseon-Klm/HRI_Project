@@ -6,6 +6,20 @@ from collections import deque
 from dataclasses import dataclass
 import cv2
 
+# ======================
+# ===== 사용자 설정 =====
+# ======================
+traj_idx = 1   # <==== ★ 매 실행마다 여기만 수동으로 바꾸면 됨
+K = 3
+hz = 0.5
+period = 1.0 / hz  # 2.0 sec
+
+out_root = "./nav_dataset"
+img_dir  = os.path.join(out_root, "images")
+jsonl_path = os.path.join(out_root, "train_unlabeled.jsonl")
+
+# ======================
+
 @dataclass
 class SampleMeta:
     t: float
@@ -15,9 +29,7 @@ def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
 def build_query(instruction: str, gesture: str, k: int) -> str:
-    # Qwen2-VL(ms-swift) 포맷: 이미지 수만큼 <image>를 query에 포함 :contentReference[oaicite:2]{index=2}
     img_tokens = "<image>" * k
-    # K=3에서 “거리감/시간감” 학습을 돕기 위해 시간 간격을 명시적으로 넣어주는 게 좋아요.
     return (
         f"{img_tokens}\n"
         "You are a short-horizon navigation policy for a mobile robot.\n"
@@ -31,37 +43,22 @@ def build_query(instruction: str, gesture: str, k: int) -> str:
     )
 
 def main():
-    # ====== 사용자 설정 ======
-    out_root = "./nav_dataset/traj#"
-    img_dir  = os.path.join(out_root, "images")
-    jsonl_path = os.path.join(out_root, "train_unlabeled.jsonl")
-    K = 3
-    hz = 0.5
-    period = 1.0 / hz  # 2.0 sec
-
     ensure_dir(out_root)
     ensure_dir(img_dir)
 
-    # ====== 여기만 네 코드 객체로 교체 ======
-    # frame_provider는 "현재 BGR 프레임 반환" 함수/객체면 충분
-    # 예: frame_bgr = cam_thread.get_latest_frame()
+    # ===== 네 파이프라인 재사용 =====
     from hint_task import open_realsense_capture, GestureCamera, _normalize_gesture_for_prompt
     cap, _, _ = open_realsense_capture()
     cam_thread = GestureCamera(cap=cap)
     cam_thread.start()
 
-    # 초기 instruction/gesture는 네 파이프라인에서 이미 얻는다고 했으니
-    # 여기서는 예시로 환경변수/입력으로 받게 해둘게요.
     instruction = os.environ.get("NAV_INSTRUCTION", "저쪽으로 가")
-    gesture_raw = os.environ.get("NAV_GESTURE", "left")  # left/right/none 등
+    gesture_raw = os.environ.get("NAV_GESTURE", "left")
     gesture = _normalize_gesture_for_prompt(gesture_raw)
 
-    # ====== K-window 버퍼 ======
     buf = deque(maxlen=K)
-
-    # ====== 루프 ======
     frame_idx = 1
-    sample_idx = 1
+
     try:
         while True:
             t0 = time.time()
@@ -69,47 +66,44 @@ def main():
             if frame_bgr is None:
                 time.sleep(0.05)
                 continue
-    
+
             ts = time.time()
-            img_name = f"frame{frame_idx}.jpg"
+            img_name = f"traj{traj_idx}_frame{frame_idx:06d}.jpg"
             img_path = os.path.join(img_dir, img_name)
-            ok = cv2.imwrite(img_path, frame_bgr)
-            if not ok:
+
+            if not cv2.imwrite(img_path, frame_bgr):
                 print("[WARN] cv2.imwrite failed:", img_path)
                 time.sleep(period)
                 continue
-    
-            buf.append(SampleMeta(t=ts, img_path=img_path))
-    
+
+            buf.append(SampleMeta(t=ts, img_path=f"images/{img_name}"))
+
             if len(buf) == K:
-                images = [m.img_path for m in list(buf)]
+                images = [m.img_path for m in buf]
                 query = build_query(instruction, gesture, K)
-    
+
                 row = {
-                    "id": f"nav_{sample_idx:08d}",
+                    "id": f"traj{traj_idx}_{frame_idx:06d}",
                     "query": query,
-                    "response": "",
+                    "response": "",  # 나중에 수동 라벨링
                     "images": images,
                     "meta": {
+                        "traj_idx": traj_idx,
                         "instruction": instruction,
                         "gesture": gesture,
                         "hz": hz,
                         "k": K,
-                        "timestamps": [m.t for m in list(buf)],
+                        "timestamps": [m.t for m in buf],
                     },
                 }
-    
+
                 with open(jsonl_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    
-                print(f"[SAVE] sample id={row['id']} images={len(images)} -> {jsonl_path}")
-                sample_idx += 1
-    
+
+                print(f"[SAVE] traj={traj_idx} frame={frame_idx} images={images}")
+
             frame_idx += 1
-    
-            dt = time.time() - t0
-            sleep_s = max(0.0, period - dt)
-            time.sleep(sleep_s)
+            time.sleep(max(0.0, period - (time.time() - t0)))
 
     except KeyboardInterrupt:
         print("\n[INFO] stop")
