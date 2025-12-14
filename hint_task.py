@@ -746,7 +746,7 @@ def main():
             print("--------------------------------------------------------")
             print("-" * 60)
             i+=1
-            time.sleep(6.0)
+            #time.sleep(6.0)
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
