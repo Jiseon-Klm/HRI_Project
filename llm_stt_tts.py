@@ -122,57 +122,134 @@ class STTProcessor:
 
         return candidate
 
-    def listen_once(self, volume_level_changed, duration_sec: int | None = None):
+    def listen_once(
+        self,
+        volume_level_changed,
+        duration_sec: int | None = None,   # <- 인터페이스 유지 (hint_task.py 수정 최소화)
+        silence_threshold: float = 0.01,   # RMS 임계값 (환경 따라 튜닝)
+        max_duration: float = 8.0,         # 최장 녹음 시간(초) - 무한 대기 방지
+        min_speech_sec: float = 0.25,      # 이만큼은 말해야 "발화로 인정"
+    ):
         """
-        - arecord를 사용해서 지정된 ALSA 디바이스에서 고정 길이 녹음.
-        - duration_sec가 None이면 self.record_duration_sec 사용.
-        - 녹음이 끝나면 OUTPUT_FILE 경로를 반환.
+        VAD 스타일 녹음:
+        - (발화 시작 전) 무한정 대기 가능
+        - 발화(energy > threshold) 감지되면 speaking=True
+        - speaking 이후 무음이 SILENCE_DURATION 초 지속되면 자동 종료
+        - 결과를 OUTPUT_FILE로 저장하고 경로 반환
         """
-        if duration_sec is None:
-            duration_sec = self.record_duration_sec
-
-        # 인터럽트 플래그 초기화
+        # duration_sec는 기존 코드 호환용으로만 남김 (여기선 기본 사용 안 함)
         self.interrupt_event.clear()
-
+    
         print(
-            f"[INFO] arecord 시작: device={self.alsa_device}, "
-            f"duration={duration_sec}s, file={OUTPUT_FILE}"
+            f"[INFO] VAD listen_once 시작: threshold={silence_threshold}, "
+            f"silence={SILENCE_DURATION}s, max={max_duration}s, file={OUTPUT_FILE}"
         )
-
-        # 볼륨 미터용 신호는 여기선 제대로 계산 못 하니 0으로 한 번 쏴줌
+    
+        # 볼륨 미터 신호 (있으면 RMS를 계속 emit)
         try:
             volume_level_changed.emit(0, 0.0)
         except Exception:
             pass
-
-        cmd = [
-            "arecord",
-            "-D",
-            self.alsa_device,
-            "-f",
-            "cd",
-            "-d",
-            str(duration_sec),
-            OUTPUT_FILE,
-        ]
-
+    
+        audio_chunks = []
+        speaking = False
+        speech_time = 0.0
+        silence_time = 0.0
+    
+        block_size = int(SAMPLE_RATE * BLOCK_DURATION)
+    
+        def callback(indata, frames, time_info, status):
+            nonlocal speaking, speech_time, silence_time
+    
+            if status:
+                # 과도한 출력은 지연을 키울 수 있으니 필요 시만
+                # print(f"[WARN] sounddevice status: {status}")
+                pass
+    
+            # indata shape: (frames, channels)
+            # channels=1 가정
+            rms = float(np.sqrt(np.mean(indata ** 2)))
+    
+            # UI용 (없어도 됨)
+            try:
+                volume_level_changed.emit(0, rms)
+            except Exception:
+                pass
+    
+            audio_chunks.append(indata.copy())
+    
+            if rms >= silence_threshold:
+                speaking = True
+                speech_time += BLOCK_DURATION
+                silence_time = 0.0
+            else:
+                if speaking:
+                    silence_time += BLOCK_DURATION
+    
+        t0 = time.perf_counter()
+    
         try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=True,
-            )
-            # 필요하면 proc.stdout 로그 찍어서 디버깅 가능
-            # print(proc.stdout)
-        except subprocess.CalledProcessError as e:
-            print("[ERROR] arecord 실행 실패:")
-            print(e.stdout)
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=block_size,
+                callback=callback,
+            ):
+                # 루프는 callback이 버퍼를 채우는 동안 조건만 체크
+                while True:
+                    if self.interrupt_event.is_set():
+                        print("[INFO] interrupt_event set -> 녹음 중단")
+                        break
+    
+                    time.sleep(BLOCK_DURATION)
+    
+                    # 아직 말 시작 안 했으면 계속 대기
+                    # (원하면 여기서 "초기 무음 N초면 종료" 같은 정책도 가능)
+                    if not speaking:
+                        # max_duration은 "전체 대기 시간"으로도 작동
+                        if (time.perf_counter() - t0) > max_duration:
+                            print("[WARN] 발화 시작 없이 max_duration 초과 -> 종료")
+                            break
+                        continue
+    
+                    # speaking 이후 무음이 SILENCE_DURATION 이상이면 종료
+                    if silence_time >= SILENCE_DURATION:
+                        # 너무 짧게 툭 소리만 난 경우 필터
+                        if speech_time < min_speech_sec:
+                            # 발화로 인정 못할 정도로 짧으면 리셋하고 다시 대기
+                            print("[WARN] 발화가 너무 짧음 -> 다시 대기")
+                            speaking = False
+                            speech_time = 0.0
+                            silence_time = 0.0
+                            audio_chunks.clear()
+                            t0 = time.perf_counter()
+                            continue
+    
+                        print("[INFO] 무음 감지 -> 녹음 종료")
+                        break
+    
+                    # speaking 상태에서 max_duration 초과하면 강제 종료
+                    if (time.perf_counter() - t0) > max_duration:
+                        print("[WARN] speaking 상태에서 max_duration 초과 -> 종료")
+                        break
+    
+        except Exception as e:
+            print(f"[ERROR] sounddevice 입력 스트림 열기 실패: {e}")
+            print("[HINT] 도커/권한 문제면 /dev/snd 마운트 또는 Pulse/ALSA 설정을 확인해야 해요.")
             return None
-
-        print(f"[INFO] 녹음 완료: {OUTPUT_FILE}")
+    
+        if not audio_chunks:
+            print("[WARN] 녹음된 오디오 없음")
+            return None
+    
+        audio = np.concatenate(audio_chunks, axis=0)  # shape (T, 1)
+    
+        # float32 -> wav 저장
+        sf.write(OUTPUT_FILE, audio, SAMPLE_RATE)
+        print(f"[INFO] VAD 녹음 완료: {OUTPUT_FILE} (samples={len(audio)})")
         return OUTPUT_FILE
+
 
     def transcribe(self, audio_file):
         print(f"[INFO] '{audio_file}' STT 처리 중...")
