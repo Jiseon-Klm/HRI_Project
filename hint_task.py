@@ -442,11 +442,6 @@ def query_chatgpt_action(
         if turn_satisfied_str not in ("true", "false"):
             turn_satisfied_str = "false"
 
-    print(f"[DEBUG] ChatGPT spoken_text    : {spoken_text}")
-    print(f"[DEBUG] ChatGPT gesture_str    : {gesture_str}")
-    print(f"[DEBUG] ChatGPT past_action    : {past_action_tail}")
-    print(f"[DEBUG] ChatGPT turn_satisfied : {turn_satisfied_str}")
-
     # <==== CHANGED: JSON array로만 출력 강제
     system_instruction = (
         "You are a navigation decision module for a mobile robot.\n"
