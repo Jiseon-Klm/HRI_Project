@@ -517,7 +517,6 @@ def query_chatgpt_action(
         reason = f"JSON parse error: {e} | raw={full_text}"
 
     t_total1 = time.perf_counter()
-    print(f"[TIME] LLM 답변 받는데만 걸린 시간: {(t_llm1 - t_llm0):.1f} s")
     print(f"[TIME] total per-frame (encode+LLM+parse): {(t_total1 - t_total0):.3f} s")
 
     return next_action, reason
