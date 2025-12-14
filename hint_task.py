@@ -609,6 +609,7 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
       - next_action ∈ ACTION_SPACE
       - full_text  : ChatGPT가 생성한 전체 응답 문자열
     """
+    t_total0 = time.perf_counter()
     if frame_bgr is None:
         print("[WARN] frame_bgr가 None → 안전하게 'stop' 반환")
         return "stop", "[LLM] no frame_bgr (returned 'stop')"
@@ -627,6 +628,7 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
             raise RuntimeError("cv2.imencode failed")
         
         data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
+      
     except Exception as e:
         print(f"[ERROR] 이미지 인코딩 실패 ({e}) → 'stop' 반환")
         return "stop", "[LLM] jpeg encode failed (returned 'stop')"
@@ -710,7 +712,9 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
         # 3) 그래도 못 찾으면 stop
         if next_action is None:
             next_action = "stop"
-    print(f"[TIME] LLM round-trip (responses.create): {(t_llm1 - t_llm0)*1000:.1f} ms")
+    t_total1 = time.perf_counter()
+    print(f"[TIME] LLM 답변 받는데만 걸린 시간: {(t_llm1 - t_llm0):.1f} s")
+    print(f"[TIME] 한번 예측에 걸린 총 시간 - total per-frame (encode+LLM+parse): {(t_total1 - t_total0):.1f} ms")
     return next_action, full_text
 
 
@@ -763,7 +767,7 @@ def main():
             t_stt0 = time.perf_counter() 
             spoken_text = stt.transcribe(audio_file=audio_path).strip()
             t_stt1 = time.perf_counter()
-            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0)*1000:.1f} ms")
+            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0):.1f} ms")
             if not spoken_text:
                 print("[MAIN] STT 결과가 비어 있음, 다시 대기")
                 continue
