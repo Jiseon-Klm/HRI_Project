@@ -68,7 +68,7 @@ def main():
                 continue
 
             ts = time.time()
-            img_name = f"traj{traj_idx}_frame{frame_idx:06d}.jpg"
+            img_name = f"traj{traj_idx}_frame{frame_idx:04d}.jpg"
             img_path = os.path.join(img_dir, img_name)
 
             if not cv2.imwrite(img_path, frame_bgr):
@@ -83,7 +83,7 @@ def main():
                 query = build_query(instruction, gesture, K)
 
                 row = {
-                    "id": f"traj{traj_idx}_{frame_idx:06d}",
+                    "id": f"traj{traj_idx}_{frame_idx:04d}",
                     "query": query,
                     "response": "",  # 나중에 수동 라벨링
                     "images": images,
