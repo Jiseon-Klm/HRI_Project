@@ -681,31 +681,22 @@ def main():
     initial_gesture = None
 
     try:
-        while True:
-            print("\n[MAIN] 초기 instruction 발화를 기다리는 중... (ReSpeaker로 말해줘)")
-            
-            audio_path = stt.listen_once(volume_level_changed=dummy_volume)
-            
-
-            if audio_path is None:
-                print("[MAIN] 녹음된 오디오가 없음, 다시 대기")
-                continue
-            t_stt0 = time.perf_counter() 
-            spoken_text = stt.transcribe(audio_file=audio_path).strip()
-            t_stt1 = time.perf_counter()
-            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0)*1000:.1f} ms")
-            if not spoken_text:
-                print("[MAIN] STT 결과가 비어 있음, 다시 대기")
-                continue
-
-            # 여기서 STT가 성공한 시점의 제스처를 freeze
-            cam_thread.freeze_gesture_once()
-            initial_gesture = cam_thread.get_gesture()
-
-            spoken_text_initial = spoken_text
-            print(f"[INIT] 초기 instruction STT: {spoken_text_initial}")
-            print(f"[INIT] 초기 제스처: {initial_gesture}")
-            break
+        # <==== 핵심: VAD 기반으로 "말 시작~말 끝" 녹음 + STT까지 한 번에 끝냄
+        # 제스처 freeze 타이밍은 "말 끝"에 거는 게 보통 더 안전해요(말하는 동안 제스처 인식 시간 확보)
+        spoken_text_initial = stt.listen_and_transcribe_once(
+            volume_level_changed=dummy_volume,
+            on_speech_end=cam_thread.freeze_gesture_once,   # <==== 여기!
+        )
+        
+        if not spoken_text_initial:
+            print("[FATAL] STT 결과가 비어있거나 VAD 대기/녹음이 실패했어요. 다시 실행해줘.")
+            cam_thread.stop()
+            cam_thread.join()
+            return
+        
+        initial_gesture = cam_thread.get_gesture()
+        print(f"[INIT] 초기 instruction STT: {spoken_text_initial}")
+        print(f"[INIT] 초기 제스처: {initial_gesture}")
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt, 초기 STT 단계에서 종료.")
