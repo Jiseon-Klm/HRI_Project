@@ -50,8 +50,13 @@ class STTProcessor:
         self.interrupt_event = threading.Event()
 
         # ---- 입력 디바이스 자동 선택 (ReSpeaker 우선) ----
-        self.input_device_id = self._detect_respeaker_input_device_id()
-        print(f"[INFO] STT input device_id: {self.input_device_id}")
+        self.card_number, self.device_number = self._detect_respeaker_card_device()   # <==== 추가
+        self.alsa_device = f"plughw:{self.card_number},{self.device_number}"          # <==== 추가
+        print(f"[INFO] Detected ReSpeaker ALSA device: {self.alsa_device}")           # <==== 추가
+        
+        self.input_device_id = self._map_alsa_card_to_sounddevice_id(
+            card=self.card_number, dev=self.device_number
+        )  # <==== 추가
 
         # ---- 채널 수 결정 (가능하면 1ch로 다운믹스) ----
         dev_info = sd.query_devices(self.input_device_id, "input")
@@ -66,6 +71,67 @@ class STTProcessor:
 
         self.silence_threshold = self.base_noise * 3.5
         print(f"[INFO] base_noise(RMS)={self.base_noise:.6f}, silence_threshold={self.silence_threshold:.6f}")
+        
+    def _map_alsa_card_to_sounddevice_id(self, card: int, dev: int) -> int:
+        """
+        arecord -l로 얻은 (card, dev)을 sounddevice(PortAudio) 입력 장치 id로 매핑.
+        - 우선순위:
+          1) device name에 "hw:card,dev" / "plughw:card,dev" / "card,dev" 같은 패턴이 포함된 입력장치
+          2) 그게 없으면 'respeaker/mic array/arrayuac' 키워드 매칭 입력장치
+        - hostapi가 ALSA인 장치를 약간 우대
+        """
+        targets = [
+            f"hw:{card},{dev}",
+            f"plughw:{card},{dev}",
+            f"{card},{dev}",
+            f"card {card}",
+        ]
+        kw_fallback = ["respeaker", "mic array", "arrayuac", "uac1", "usb audio"]
+    
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    
+        scored = []
+        for idx, d in enumerate(devices):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            name = (d.get("name", "") or "").lower()
+    
+            score = 0
+            for t in targets:
+                if t in name:
+                    score += 10
+            for kw in kw_fallback:
+                if kw in name:
+                    score += 2
+    
+            host = (hostapis[d["hostapi"]]["name"] or "").lower()
+            if "alsa" in host:
+                score += 1  # ALSA hostapi면 약간 우대
+    
+            if score > 0:
+                scored.append((score, idx, d.get("name", ""), host))
+    
+        if scored:
+            scored.sort(reverse=True, key=lambda x: x[0])
+            best = scored[0]
+            print(f"[INFO] Matched input device: idx={best[1]}, score={best[0]}, hostapi={best[3]}, name='{best[2]}'")
+            return best[1]
+    
+        # ---- 여기까지 왔으면 매핑 실패: 디버그용으로 입력 장치 목록을 출력하고 fallback ----
+        print("[WARN] ALSA(card,dev) -> sounddevice 매핑 실패. 현재 입력 장치 목록:")
+        for idx, d in enumerate(devices):
+            if d.get("max_input_channels", 0) > 0:
+                host = (hostapis[d["hostapi"]]["name"] or "")
+                print(f"  [{idx}] hostapi={host} name='{d.get('name','')}' in_ch={d.get('max_input_channels')}")
+    
+        # 마지막 fallback: 기본 입력 장치
+        default_in = sd.default.device[0]
+        if default_in is None:
+            print("[WARN] sd.default.device[0] is None -> 0 fallback")
+            return 0
+        print(f"[WARN] fallback to default input device_id={default_in}")
+        return int(default_in)
 
     def request_interrupt(self):
         """외부에서 STT 대기를 끊고 싶을 때 사용"""
