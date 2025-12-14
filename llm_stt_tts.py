@@ -2,7 +2,9 @@ import subprocess
 import threading
 import time
 import re
-
+import queue
+from collections import deque
+import math
 import whisper                         # ✅ STT용 Whisper
 from transformers import VitsModel, AutoTokenizer
 import sounddevice as sd               # (TTS에서만 사용)
@@ -30,317 +32,276 @@ from config import (
 
 class STTProcessor:
     """
-    - 처음 생성될 때 `arecord -l` 결과에서
-      'ReSpeaker 4 Mic Array (UAC1.0)'가 있는 card/device를 자동으로 찾는다.
-    - 이후 listen_once()를 부르면
-      arecord -D plughw:{card},{device} -f cd -d {duration_sec} OUTPUT_FILE
-      로 WAV를 녹음한 뒤 Whisper STT 수행.
+    VAD 기반 STT:
+    - (1) PortAudio 입력 장치 목록에서 ReSpeaker를 자동 탐색
+    - (2) 배경 소음 RMS 측정 → silence_threshold 자동 설정
+    - (3) 말 시작(avg_rms > START_THRESHOLD) 때부터 프레임 저장 시작
+    - (4) 무음이 SILENCE_DURATION 이상 지속되면 녹음 종료
+    - (5) OUTPUT_FILE로 저장 후 Whisper STT 수행
     """
 
-    def __init__(self, record_duration_sec: int = 5):
+    def __init__(self):
         print("[INFO] Whisper 모델 로딩 중...")
         self.whisper_model = whisper.load_model(MODEL_NAME)
         print("[INFO] 모델 로드 완료.")
 
-        self.record_duration_sec = record_duration_sec
+        # ---- VAD 관련 ----
+        self.audio_queue = queue.Queue()
         self.interrupt_event = threading.Event()
 
-        # ReSpeaker ALSA card/device 자동 탐지
-        self.card_number, self.device_number = self._detect_respeaker_card_device()
-        self.alsa_device = f"plughw:{self.card_number},{self.device_number}"
-        print(f"[INFO] Detected ReSpeaker ALSA device: {self.alsa_device}")
+        # ---- 입력 디바이스 자동 선택 (ReSpeaker 우선) ----
+        self.input_device_id = self._detect_respeaker_input_device_id()
+        print(f"[INFO] STT input device_id: {self.input_device_id}")
+
+        # ---- 채널 수 결정 (가능하면 1ch로 다운믹스) ----
+        dev_info = sd.query_devices(self.input_device_id, "input")
+        max_ch = int(dev_info.get("max_input_channels", 1))
+        self.channels = 1 if max_ch >= 1 else 1  # <==== 안전하게 1ch
+        print(f"[INFO] STT input channels: {self.channels}")
+
+        # ---- 배경 소음 측정 → threshold 자동 설정 ----
+        self.base_noise = self._measure_noise_level(duration=1.0)
+        # 너무 낮게 잡히면(완전 무음) threshold가 0에 붙어서 오탐이 커짐 → floor
+        self.base_noise = max(self.base_noise, 1e-4)
+
+        self.silence_threshold = self.base_noise * 3.5
+        print(f"[INFO] base_noise(RMS)={self.base_noise:.6f}, silence_threshold={self.silence_threshold:.6f}")
 
     def request_interrupt(self):
-        """
-        옛날 sounddevice 기반 VAD 인터페이스와 호환용.
-        지금 구조에서는 arecord를 동기 호출하므로 별도 중단은 구현 안 했고,
-        그냥 플래그만 세팅해둠.
-        """
+        """외부에서 STT 대기를 끊고 싶을 때 사용"""
         self.interrupt_event.set()
 
-    def _detect_respeaker_card_device(self):
+    # -------------------------
+    # Device detect
+    # -------------------------
+    def _detect_respeaker_input_device_id(self):
         """
-        arecord -l 출력 예:
-
-        card 1: ArrayUAC10 [ReSpeaker 4 Mic Array (UAC1.0)], device 0: USB Audio [USB Audio]
-          Subdevices: 1/1
-          Subdevice #0: subdevice #0
-        card 3: Generic_1 [HD-Audio Generic], device 0: ALC1220 Analog [ALC1220 Analog]
-
-        여기서 'ReSpeaker', 'ArrayUAC10', 'Mic Array', 'USB Audio' 같은 키워드가
-        포함된 라인에서 card / device 번호를 뽑는다.
+        sounddevice(PortAudio) 입력 장치 목록에서 ReSpeaker를 찾아 device index를 반환.
+        실패하면 기본 입력 장치로 fallback.
         """
-        print("[INFO] ReSpeaker ALSA 디바이스 자동 탐색: `arecord -l` 실행")
-
-        try:
-            proc = subprocess.run(
-                ["arecord", "-l"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"[ERROR] `arecord -l` 실행 실패: {e}")
-
-        output_lines = proc.stdout.splitlines()
-
         preferred_keywords = [
-            "ReSpeaker",
-            "ArrayUAC10",
-            "Mic Array",
-            "USB Audio",
+            "respeaker",
+            "arrayuac",
+            "mic array",
+            "uac1",
+            "usb audio",
         ]
 
-        candidate = None
+        devices = sd.query_devices()
+        candidates = []
 
-        for line in output_lines:
-            line = line.strip()
-            if not line.startswith("card "):
+        for idx, d in enumerate(devices):
+            if d.get("max_input_channels", 0) <= 0:
                 continue
+            name = (d.get("name", "") or "").lower()
+            score = sum(1 for kw in preferred_keywords if kw in name)
+            if score > 0:
+                candidates.append((score, idx, d.get("name", "")))
 
-            # ReSpeaker 관련 키워드가 포함된 card 라인만 필터링
-            if not any(kw in line for kw in preferred_keywords):
-                continue
+        if candidates:
+            candidates.sort(reverse=True, key=lambda x: x[0])
+            score, idx, name = candidates[0]
+            print(f"[INFO] ReSpeaker 후보 선택: idx={idx}, score={score}, name='{name}'")
+            return idx
 
-            # 예: "card 1: ArrayUAC10 [...], device 0: USB Audio [...]"
-            m = re.search(r"card\s+(\d+):.*device\s+(\d+):", line)
-            if m:
-                card = int(m.group(1))
-                dev = int(m.group(2))
-                candidate = (card, dev)
-                print(f"[INFO] ReSpeaker 후보 디바이스 발견: card={card}, device={dev}, line='{line}'")
-                break
+        # fallback
+        try:
+            default_in = sd.default.device[0]  # (input, output)
+            if default_in is None:
+                raise RuntimeError("sd.default.device[0] is None")
+            print(f"[WARN] ReSpeaker를 못 찾아 기본 입력 장치 사용: {default_in}")
+            return default_in
+        except Exception as e:
+            print(f"[WARN] 기본 입력 장치 조회 실패: {e} → device_id=0 사용")
+            return 0
 
-        if candidate is None:
-            # 진짜 ReSpeaker가 안 붙어 있으면 여기서 에러
-            raise RuntimeError(
-                "[ERROR] `arecord -l` 출력에서 ReSpeaker 디바이스를 찾지 못했습니다.\n"
-                "ReSpeaker가 제대로 연결되어 있는지, 컨테이너에 /dev/snd 가 마운트되어 있는지,\n"
-                "`arecord -l` 출력에 'ReSpeaker 4 Mic Array (UAC1.0)' 가 보이는지 확인하세요."
-            )
+    # -------------------------
+    # Noise measure
+    # -------------------------
+    def _measure_noise_level(self, duration=1.0):
+        print("[INFO] 배경 소음 측정 중...")
+        frames = int(SAMPLE_RATE * duration)
 
-        return candidate
-        
-    def listen_once(
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=self.channels,
+            dtype="float32",
+            device=self.input_device_id,
+            blocksize=frames,   # <==== 한 번에 읽기
+        ) as stream:
+            data, _ = stream.read(frames)
+
+        # (N, C)일 경우 mono로 다운믹스
+        if data.ndim == 2 and data.shape[1] > 1:
+            data = np.mean(data, axis=1, keepdims=True)
+
+        rms = float(np.sqrt(np.mean(np.square(data))))
+        print(f"[INFO] 배경 RMS: {rms:.6f}")
+        return rms
+
+    # -------------------------
+    # Audio callback
+    # -------------------------
+    def _audio_callback(self, indata, frames, time_info, status):
+        if status:
+            # underrun/overrun 등 경고는 로그만
+            # print(f"[WARN] audio status: {status}")
+            pass
+        self.audio_queue.put(indata.copy())
+
+    # -------------------------
+    # VAD listen
+    # -------------------------
+    def listen_once_vad(
         self,
         volume_level_changed,
-        duration_sec: int | None = None,   # <- hint_task.py 호환용(실제론 VAD가 종료 결정)
-        # ---- VAD 파라미터(기본값만으로도 대부분 동작) ----
-        start_threshold: float = 0.006,    # RMS 시작 임계값 (환경 따라 0.003~0.02 튜닝)
-        stop_threshold: float | None = None,  # None이면 start_threshold*0.6 사용 (hysteresis)
-        start_blocks: int = 3,             # 연속 N블록 이상 넘어야 "발화 시작" 인정
-        min_speech_sec: float = 0.25,      # 너무 짧은 소리는 무시(오탐 제거)
-        max_wait_sec: float = 30.0,        # 말 시작을 최대 몇 초 기다릴지
-        max_record_sec: float = 12.0,      # 말 시작 후 최대 녹음 길이(무한 녹음 방지)
-        preroll_sec: float = 0.20,         # 발화 시작 직전 N초를 포함(초반 잘림 방지)
+        on_speech_start=None,
+        on_speech_end=None,
+        max_wait_sec=60.0,      # <==== 말 시작을 최대 얼마나 기다릴지
+        max_record_sec=20.0,    # <==== 말이 계속 이어질 때 무한 녹음 방지
     ):
         """
-        arecord 스트리밍 + RMS 기반 VAD:
-        - 발화 시작 전: RMS가 start_threshold 이상인 블록이 start_blocks 연속이면 시작
-        - 시작 후: RMS가 stop_threshold 미만인 무음이 SILENCE_DURATION 지속되면 종료
-        - preroll_sec 만큼의 직전 버퍼를 포함해 WAV 저장
-        - 반환: OUTPUT_FILE 경로 or None
+        말 시작/끝 자동 감지로 한 번 발화만 녹음해서 OUTPUT_FILE로 저장하고 경로 반환.
+        - 말 시작: avg_rms > START_THRESHOLD
+        - 말 끝  : (avg_rms < silence_threshold) 상태가 SILENCE_DURATION 이상 지속
         """
-    
-        import io
-        import select
-        from collections import deque
-    
         self.interrupt_event.clear()
-    
-        if stop_threshold is None:
-            stop_threshold = start_threshold * 0.6  # hysteresis: 종료는 더 낮은 임계로
-    
-        # ---- 오디오 포맷 (속도/안정성) ----
-        # Whisper 표준: 16kHz mono PCM 16bit
-        # 이렇게 받으면 파일도 작아지고 Whisper도 빨라짐.
-        SR = 16000
-        CH = 1
-        SAMPLE_WIDTH = 2  # int16
-    
-        block_frames = max(160, int(SR * BLOCK_DURATION))  # 최소 10ms 정도 확보
-        block_bytes = block_frames * CH * SAMPLE_WIDTH
-    
-        preroll_blocks = max(0, int(preroll_sec / BLOCK_DURATION))
-        preroll = deque(maxlen=preroll_blocks)
-    
-        # 상태
-        speaking = False
-        above_cnt = 0
-        speech_time = 0.0
-        silence_time = 0.0
-    
-        # 최종 저장 버퍼 (bytes)
-        captured = bytearray()
-    
-        print(
-            f"[INFO] VAD arecord listen_once 시작: start_th={start_threshold:.4f}, "
-            f"stop_th={stop_threshold:.4f}, start_blocks={start_blocks}, "
-            f"silence={SILENCE_DURATION}s, wait<={max_wait_sec}s, rec<={max_record_sec}s, "
-            f"file={OUTPUT_FILE}"
-        )
-    
-        # 볼륨 미터 초기 emit
-        try:
-            volume_level_changed.emit(0, 0.0)
-        except Exception:
-            pass
-    
-        # ---- arecord: ReSpeaker 디바이스에서 raw PCM을 stdout으로 ----
-        # -t raw: 헤더 없이 raw stream
-        # -f S16_LE: 16-bit little-endian
-        # -c 1: mono
-        # -r 16000: 16k
-        cmd = [
-            "arecord",
-            "-D", self.alsa_device,
-            "-q",                  # quieter
-            "-t", "raw",
-            "-f", "S16_LE",
-            "-c", str(CH),
-            "-r", str(SR),
-        ]
-    
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-            )
-        except Exception as e:
-            print(f"[ERROR] arecord Popen 실패: {e}")
-            return None
-    
-        t_wait0 = time.perf_counter()
-        t_speech0 = None
-    
-        def _rms_int16(block: bytes) -> float:
-            # int16 -> float RMS (빠르게 numpy 사용)
-            x = np.frombuffer(block, dtype=np.int16).astype(np.float32)
-            if x.size == 0:
-                return 0.0
-            return float(np.sqrt(np.mean((x / 32768.0) ** 2)))
-    
-        try:
-            assert proc.stdout is not None
-            stdout = proc.stdout
-    
+
+        recorded_frames = []
+        rms_buffer = deque(maxlen=10)
+
+        started = False
+        t0 = time.time()
+        start_time = None
+        last_sound_time = None
+
+        START_THRESHOLD = self.silence_threshold * 1.6
+        MIN_DURATION = 0.6  # 너무 짧은 오탐 방지
+
+        # 볼륨 표시(디버깅/UI용) 변환 파라미터
+        MIN_DB = -60.0
+        MAX_DB = 0.0
+
+        blocksize = int(SAMPLE_RATE * BLOCK_DURATION)  # <==== config의 BLOCK_DURATION 사용
+
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=self.channels,
+            dtype="float32",
+            device=self.input_device_id,
+            blocksize=blocksize,
+            callback=self._audio_callback,
+        ):
             while True:
+                # 외부 인터럽트
                 if self.interrupt_event.is_set():
-                    print("[INFO] interrupt_event set -> 녹음 중단")
+                    print("[INFO] STT listen_once_vad 인터럽트 → 중단")
+                    return None
+
+                # 말 시작 최대 대기 시간
+                if (time.time() - t0) > max_wait_sec and (not started):
+                    print("[WARN] 말 시작 대기 timeout")
+                    return None
+
+                # 녹음 최대 시간 (말이 계속 이어지거나 threshold가 잘못돼도 안전 탈출)
+                if started and (time.time() - start_time) > max_record_sec:
+                    print("[WARN] max_record_sec 도달 → 강제 종료")
                     break
-    
-                # 시작 전 최대 대기 시간
-                if not speaking and (time.perf_counter() - t_wait0) > max_wait_sec:
-                    print("[WARN] 발화 시작 없이 max_wait_sec 초과 -> 종료")
-                    break
-    
-                # speaking 이후 최대 녹음 시간
-                if speaking and t_speech0 is not None and (time.perf_counter() - t_speech0) > max_record_sec:
-                    print("[WARN] speaking 상태에서 max_record_sec 초과 -> 종료")
-                    break
-    
-                # stdout에서 block_bytes 만큼 읽기 (ready 될 때만)
-                rlist, _, _ = select.select([stdout], [], [], 0.5)
-                if not rlist:
-                    continue
-    
-                block = stdout.read(block_bytes)
-                if not block or len(block) == 0:
-                    # arecord 종료/에러
-                    break
-    
-                rms = _rms_int16(block)
-    
-                # UI용 emit (있으면)
+
                 try:
-                    volume_level_changed.emit(0, rms)
+                    block = self.audio_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                # stereo/multi면 mono로 다운믹스
+                if block.ndim == 2 and block.shape[1] > 1:
+                    block_mono = np.mean(block, axis=1, keepdims=True)
+                else:
+                    block_mono = block
+
+                rms = float(np.sqrt(np.mean(block_mono ** 2)))
+                rms_buffer.append(rms)
+                avg_rms = float(np.mean(rms_buffer))
+
+                # volume_level_changed (있으면)
+                try:
+                    db = 20.0 * math.log10(rms + 1e-8)
+                    db_clamped = max(MIN_DB, min(MAX_DB, db))
+                    level = int((db_clamped - MIN_DB) / (MAX_DB - MIN_DB) * 100)
+                    volume_level_changed.emit(level, db_clamped + 50)
                 except Exception:
                     pass
-    
-                if not speaking:
-                    # preroll 채우기
-                    if preroll_blocks > 0:
-                        preroll.append(block)
-    
-                    if rms >= start_threshold:
-                        above_cnt += 1
-                    else:
-                        above_cnt = 0
-    
-                    if above_cnt >= start_blocks:
-                        speaking = True
-                        t_speech0 = time.perf_counter()
-                        silence_time = 0.0
-                        speech_time = 0.0
-    
-                        # preroll 포함
-                        if preroll_blocks > 0 and len(preroll) > 0:
-                            for b in preroll:
-                                captured.extend(b)
-                        preroll.clear()
-    
-                        captured.extend(block)
-                        speech_time += BLOCK_DURATION
+
+                # ---- 말 시작 감지 ----
+                if not started:
+                    if avg_rms > START_THRESHOLD:
+                        started = True
+                        start_time = time.time()
+                        last_sound_time = start_time
+                        print("[INFO] VAD: speech start")
+
+                        if callable(on_speech_start):
+                            try:
+                                on_speech_start()
+                            except Exception as e:
+                                print(f"[WARN] on_speech_start callback error: {e}")
+
+                        recorded_frames.append(block_mono)
+                    continue
+
+                # ---- 녹음 중 ----
+                recorded_frames.append(block_mono)
+
+                if avg_rms > self.silence_threshold:
+                    last_sound_time = time.time()
                 else:
-                    # speaking 중: 항상 저장
-                    captured.extend(block)
-                    speech_time += BLOCK_DURATION
-    
-                    if rms < stop_threshold:
-                        silence_time += BLOCK_DURATION
-                    else:
-                        silence_time = 0.0
-    
-                    # 종료 조건: 무음이 SILENCE_DURATION 지속
-                    if silence_time >= SILENCE_DURATION:
-                        if speech_time < min_speech_sec:
-                            # 너무 짧은 오탐 -> 리셋하고 다시 대기
-                            print("[WARN] 발화가 너무 짧음(오탐) -> 다시 대기")
-                            speaking = False
-                            above_cnt = 0
-                            speech_time = 0.0
-                            silence_time = 0.0
-                            captured.clear()
-                            preroll.clear()
-                            t_wait0 = time.perf_counter()
-                            t_speech0 = None
-                            continue
-    
-                        print("[INFO] 무음 감지 -> 녹음 종료")
+                    now = time.time()
+                    if (now - last_sound_time > SILENCE_DURATION) and (now - start_time > MIN_DURATION):
+                        print("[INFO] VAD: speech end")
+                        if callable(on_speech_end):
+                            try:
+                                on_speech_end()
+                            except Exception as e:
+                                print(f"[WARN] on_speech_end callback error: {e}")
                         break
-    
-        finally:
-            # arecord 종료
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=1.0)
-            except Exception:
-                pass
-    
-        if len(captured) == 0:
-            print("[WARN] 녹음된 오디오 없음")
+
+        if not recorded_frames:
             return None
-    
-        # ---- raw PCM -> WAV 저장 ----
-        try:
-            audio = np.frombuffer(bytes(captured), dtype=np.int16).astype(np.float32) / 32768.0
-            audio = audio.reshape(-1, 1)  # (T,1)
-            sf.write(OUTPUT_FILE, audio, SR)
-            print(f"[INFO] VAD 녹음 완료: {OUTPUT_FILE} (sec≈{len(audio)/SR:.2f})")
-            return OUTPUT_FILE
-        except Exception as e:
-            print(f"[ERROR] WAV 저장 실패: {e}")
-            return None
+
+        audio_data = np.concatenate(recorded_frames, axis=0).astype(np.float32)
+
+        # OUTPUT_FILE 저장 (float32 → int16)
+        audio_int16 = np.int16(np.clip(audio_data, -1.0, 1.0) * 32767)
+        sf.write(OUTPUT_FILE, audio_int16, SAMPLE_RATE, subtype="PCM_16")
+        print(f"[INFO] 녹음 완료(VAD): {OUTPUT_FILE}")
+        return OUTPUT_FILE
 
     def transcribe(self, audio_file):
         print(f"[INFO] '{audio_file}' STT 처리 중...")
         result = self.whisper_model.transcribe(audio_file, language=LANG, fp16=False)
-        text = result["text"].strip()
+        text = (result.get("text", "") or "").strip()
         print(f"[INFO] STT 결과: {text}")
         return text
+
+    # -------------------------
+    # Hint task 편의를 위해: "한 번 호출로 말 기다림+녹음+STT" 제공
+    # -------------------------
+    def listen_and_transcribe_once(
+        self,
+        volume_level_changed,
+        on_speech_start=None,
+        on_speech_end=None,
+    ):
+        """
+        hint_task.py에서 while 루프 없애기 위한 원샷 API.
+        - 내부에서 VAD로 말 시작/끝까지 녹음하고
+        - 바로 STT 결과(text)를 반환
+        """
+        audio_path = self.listen_once_vad(
+            volume_level_changed=volume_level_changed,
+            on_speech_start=on_speech_start,
+            on_speech_end=on_speech_end,
+        )
+        if audio_path is None:
+            return ""
+        return self.transcribe(audio_file=audio_path).strip()
