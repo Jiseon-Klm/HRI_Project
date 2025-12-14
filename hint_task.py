@@ -17,6 +17,7 @@ import threading
 import time
 import subprocess
 import re
+import json
 import os
 import cv2
 import pyrealsense2 as rs
@@ -131,273 +132,69 @@ class RealSenseColorCap:
 
 def open_realsense_capture():
     """
-    RealSense 카메라를 robust하게 여는 함수.
-
-    1) config.CAMERA_DEVICE_ID 가 설정되어 있으면:
-       - /dev/video{CAMERA_DEVICE_ID} 를 먼저 시도하고,
-       - 성공하면 바로 반환.
-       - 실패하면 경고만 찍고 2) 자동 탐색으로 fallback.
-
-    2) 자동 탐색:
-       - `v4l2-ctl --list-devices` 에서 RealSense 블록만 모은 뒤
-       - 각 /dev/videoX 에 대해 `--list-formats-ext` 로 포맷을 보고
-         MJPG, YUYV, RGB3, BGR3 등이 있으면 "컬러 후보"로 점수 부여.
-       - 컬러 후보(dev_score > 0)만 우선 시도한다.
-       - 컬러 후보 중에서만 "멀쩡한 컬러 프레임"이 나오면 그걸 사용.
-       - 컬러 후보에서도 아무것도 못 찾으면,
-         더 이상 다른 /dev/videoX들(0,1,2,3,5...)을 억지로 시도하지 않고
-         RuntimeError로 빠르게 실패한다. (timeout 지옥 방지)
-
+    RealSense 카메라를 'pyrealsense2 COLOR 스트림'으로만 연다.
+    - V4L2(/dev/videoX) fallback을 절대 하지 않는다. (IR 혼선 근본 차단)
+    - 여러 대 연결되어 있어도 'RGB/Color 센서가 있는 디바이스'를 우선 선택한다.
     반환: (cap, index, dev_path)
-      - cap      : 열린 cv2.VideoCapture (release 하지 않은 상태)
-      - index    : /dev/videoX 의 X
-      - dev_path : "/dev/videoX"
+      - cap      : RealSenseColorCap 객체
+      - index    : 더미로 -1
+      - dev_path : 식별 문자열
     """
-    print("[INFO] RealSense 카메라 오픈: 1) pyrealsense2 color stream 우선 시도")
+    print("[INFO] RealSense 카메라 오픈: pyrealsense2 COLOR ONLY (NO V4L2 fallback)")
 
-    # <==== ADD: Deterministic path (no IR confusion)
-    if rs is not None:
+    if rs is None:
+        raise RuntimeError("pyrealsense2 is not available (rs is None).")
+
+    # 1) 연결된 디바이스 탐색
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    if len(devices) == 0:
+        raise RuntimeError("[FATAL] No RealSense device detected (rs.context().query_devices() == 0).")
+
+    # 2) 'Color/RGB 센서'가 있는 디바이스를 우선 선택
+    chosen_serial = None
+    chosen_name = None
+
+    for dev in devices:
         try:
-            cap = RealSenseColorCap(width=640, height=480, fps=30, serial=None)
-            # index/dev_path는 더 이상 의미 없지만, 기존 반환 형식을 맞추기 위해 더미로 채움
-            return cap, -1, "realsense:color(bgr8)"
-        except Exception as e:
-            print(f"[WARN] pyrealsense2 color stream 오픈 실패 -> V4L2 fallback: {e}")
+            serial = dev.get_info(rs.camera_info.serial_number)
+            name = dev.get_info(rs.camera_info.name)
 
-    print("[INFO] RealSense 카메라 자동 탐색: `v4l2-ctl --list-devices` 실행")
+            # 센서 목록에서 Color/RGB 센서 여부 확인
+            has_color = False
+            for s in dev.query_sensors():
+                try:
+                    sname = s.get_info(rs.camera_info.name).lower()
+                    # RealSense 드라이버/모델별로 표현이 조금 달라서 넉넉히 체크
+                    if ("rgb" in sname) or ("color" in sname):
+                        has_color = True
+                        break
+                except Exception:
+                    continue
 
-    # --------------------------------------------------
-    # 0) 사용자가 CAMERA_DEVICE_ID를 지정해둔 경우 우선 사용
-    # --------------------------------------------------
-    if CAMERA_DEVICE_ID is not None:
-        manual_dev = f"/dev/video{CAMERA_DEVICE_ID}"
-        print(f"[INFO] config.CAMERA_DEVICE_ID={CAMERA_DEVICE_ID} -> {manual_dev} 우선 시도")
-
-        cap = cv2.VideoCapture(manual_dev)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-            except Exception:
-                pass
-
-            # 짧게 몇 프레임만 확인
-            ok_any = False
-            frame = None
-            for _ in range(3):
-                ret, f = cap.read()
-                if ret and f is not None and f.size > 0:
-                    frame = f
-                    ok_any = True
-                    break
-                time.sleep(0.05)
-
-            if ok_any and frame is not None and len(frame.shape) == 3 and frame.shape[2] == 3:
-                b_mean = float(frame[:, :, 0].mean())
-                g_mean = float(frame[:, :, 1].mean())
-                r_mean = float(frame[:, :, 2].mean())
-                channel_means = (b_mean, g_mean, r_mean)
-                max_mean = max(channel_means)
-                min_mean = max(min(channel_means), 1e-3)
-                ratio = max_mean / min_mean
-                # print(f"[DEBUG] {manual_dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
-
-                if ratio <= 3.0:
-                    print(f"[INFO] CAMERA_DEVICE_ID로 지정된 컬러 카메라 사용: {manual_dev}")
-                    # 여기서는 cap을 유지한채로 바로 반환
-                    idx = int(CAMERA_DEVICE_ID)
-                    return cap, idx, manual_dev
-
-                else:
-                    print(f"[WARN] {manual_dev} 는 컬러 채널이 한쪽에 치우침 (ratio={ratio:.2f}) -> 무시하고 자동 탐색으로 이동")
-                    cap.release()
-            else:
-                print(f"[WARN] {manual_dev} 에서 유효한 프레임을 얻지 못함 -> 자동 탐색으로 이동")
-                cap.release()
-        else:
-            print(f"[WARN] {manual_dev} 를 열 수 없음 (isOpened()==False) -> 자동 탐색으로 이동")
-            cap.release()
-
-    # --------------------------------------------------
-    # 1) `v4l2-ctl --list-devices` 로 RealSense 블록 찾기
-    # --------------------------------------------------
-    try:
-        proc = subprocess.run(
-            ["v4l2-ctl", "--list-devices"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
-        )
-    except Exception as e:
-        raise RuntimeError(f"[ERROR] `v4l2-ctl --list-devices` 실행 실패: {e}")
-
-    lines = proc.stdout.splitlines()
-
-    current_name = None
-    current_devices = []
-    devices_info = []  # [(name, ["/dev/video0", "/dev/video1", ...]), ...]
-
-    for line in lines:
-        if not line.strip():
-            if current_name is not None:
-                devices_info.append((current_name, list(current_devices)))
-            current_name = None
-            current_devices = []
-            continue
-
-        if not line.startswith("\t") and not line.startswith(" "):
-            if current_name is not None:
-                devices_info.append((current_name, list(current_devices)))
-            current_name = line.strip().rstrip(":")
-            current_devices = []
-        else:
-            dev_path = line.strip()
-            if dev_path.startswith("/dev/video"):
-                current_devices.append(dev_path)
-
-    if current_name is not None:
-        devices_info.append((current_name, list(current_devices)))
-
-    rs_blocks = [(name, devs) for name, devs in devices_info if "realsense" in name.lower()]
-
-    if not rs_blocks:
-        raise RuntimeError(
-            "[ERROR] `v4l2-ctl --list-devices` 결과에서 RealSense 장치를 찾지 못했습니다.\n"
-            "RealSense가 /dev/video* 로 제대로 잡혀 있는지 확인하세요."
-        )
-
-    candidate_devs = []
-    for name, devs in rs_blocks:
-        print(f"[DEBUG] RealSense block: '{name}' -> {devs}")
-        candidate_devs.extend(devs)
-
-    if not candidate_devs:
-        raise RuntimeError(
-            "[ERROR] RealSense 장치는 있으나 /dev/video* 노드를 찾지 못했습니다."
-        )
-
-    # --------------------------------------------------
-    # 2) v4l2-ctl --list-formats-ext 로 "컬러 후보"만 점수 매기기
-    # --------------------------------------------------
-    color_keywords = ("mjpg", "yuyv", "rgb3", "bgr3")
-    dev_score = {}  # dev_path -> score
-
-    for dev in candidate_devs:
-        try:
-            fmt_proc = subprocess.run(
-                ["v4l2-ctl", "-d", dev, "--list-formats-ext"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=True,
-            )
-            fmt_out = fmt_proc.stdout.lower()
-        except Exception as e:
-            print(f"[WARN] {dev} 의 포맷 정보를 가져올 수 없습니다: {e}")
-            dev_score[dev] = 0
-            continue
-
-        score = 0
-        for kw in color_keywords:
-            if kw in fmt_out:
-                score += 1
-
-        dev_score[dev] = score
-        print(f"[DEBUG] {dev} pixel-format score={score}")
-
-    # 점수 > 0 인 dev만 "컬러 후보"
-    color_candidates = [d for d in candidate_devs if dev_score.get(d, 0) > 0]
-
-    if not color_candidates:
-        raise RuntimeError(
-            "[ERROR] RealSense /dev/video* 노드에서 컬러 포맷(MJPG/YUYV/RGB3/BGR3)을 찾지 못했습니다.\n"
-            "v4l2-ctl -d /dev/videoX --list-formats-ext 를 직접 확인한 뒤 CAMERA_DEVICE_ID를 수동 설정하는 걸 추천합니다."
-        )
-
-    # 점수 높은 순으로 시도
-    ordered_devs = sorted(
-        color_candidates,
-        key=lambda d: dev_score.get(d, 0),
-        reverse=True,
-    )
-
-    print(f"[DEBUG] RealSense 컬러 후보 dev 시도 순서: {ordered_devs}")
-
-    # --------------------------------------------------
-    # 3) 실제로 VideoCapture 열어서 프레임 테스트
-    #    (컬러 후보에서만 시도, 나머지는 아예 건드리지 않음 → timeout 지옥 방지)
-    # --------------------------------------------------
-    for dev in ordered_devs:
-        print(f"[INFO] RealSense 후보 노드 테스트: {dev}")
-        cap = cv2.VideoCapture(dev)
-        if not cap.isOpened():
-            print(f"[WARN] {dev} 를 열 수 없습니다 (isOpened() == False)")
-            cap.release()
-            continue
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-        except Exception:
-            pass
-
-        ok_any = False
-        frame = None
-
-        # timeout 방지를 위해 너무 많이 시도하지 않고, 3번만 시도
-        for _ in range(3):
-            ret, f = cap.read()
-            if ret and f is not None and f.size > 0:
-                frame = f
-                ok_any = True
+            if has_color:
+                chosen_serial = serial
+                chosen_name = name
                 break
-            time.sleep(0.05)
 
-        if not ok_any or frame is None:
-            print(f"[WARN] {dev} 에서 유효한 프레임을 읽지 못했습니다.")
-            cap.release()
+        except Exception:
             continue
 
-        if len(frame.shape) != 3 or frame.shape[2] != 3:
-            print(f"[WARN] {dev} 프레임이 3채널이 아님: shape={frame.shape}")
-            cap.release()
-            continue
+    # Color 센서 있는 디바이스를 못 찾으면, 그래도 첫 디바이스라도 잡아보되
+    # 이후 RealSenseColorCap에서 color stream enable 시 실패하면 바로 에러로 끝남.
+    if chosen_serial is None:
+        dev0 = devices[0]
+        chosen_serial = dev0.get_info(rs.camera_info.serial_number)
+        chosen_name = dev0.get_info(rs.camera_info.name)
+        print(f"[WARN] Color/RGB sensor device not clearly identified. Fallback to first device: {chosen_name} ({chosen_serial})")
+    else:
+        print(f"[INFO] Selected RealSense device: {chosen_name} (serial={chosen_serial})")
 
-        b_mean = float(frame[:, :, 0].mean())
-        g_mean = float(frame[:, :, 1].mean())
-        r_mean = float(frame[:, :, 2].mean())
-        channel_means = (b_mean, g_mean, r_mean)
-        max_mean = max(channel_means)
-        min_mean = max(min(channel_means), 1e-3)
-        ratio = max_mean / min_mean
+    # 3) COLOR 스트림만 여는 캡처 생성 (실패하면 즉시 예외)
+    cap = RealSenseColorCap(width=640, height=480, fps=30, serial=chosen_serial)
 
-        print(f"[DEBUG] {dev} channel means BGR={channel_means}, ratio={ratio:.2f}")
-
-        if ratio > 3.0:
-            print(f"[WARN] {dev} 프레임이 한 채널에 강하게 치우침 → 컬러 스트림 아님으로 판단하고 패스")
-            cap.release()
-            continue
-
-        m = re.search(r"/dev/video(\d+)", dev)
-        if not m:
-            print(f"[WARN] {dev} 의 인덱스를 파싱하지 못했습니다.")
-            cap.release()
-            continue
-
-        idx = int(m.group(1))
-        print(f"[INFO] 사용 가능한 RealSense 컬러 카메라 확정: device='{dev}', index={idx}")
-        return cap, idx, dev
-
-    # 여기까지 왔다는 건 "컬러 후보"들에서도 쓸만한 스트림을 찾지 못했다는 뜻
-    raise RuntimeError(
-        "[ERROR] RealSense 컬러 후보 /dev/video* 노드들 중 어떤 것도 유효한 컬러 프레임을 제공하지 않습니다.\n"
-        "실제로 어떤 /dev/videoX가 컬러인지 v4l2-ctl 로 확인 후 CAMERA_DEVICE_ID를 설정해 주세요."
-    )
+    # 4) 반환 형식은 기존 코드와 맞춤
+    return cap, -1, f"realsense:color(bgr8):{chosen_serial}"
 
 # ==========================
 # 1) 카메라 + 제스처 쓰레드 (제스처 freeze 기능 추가)
@@ -522,9 +319,9 @@ class GestureCamera(threading.Thread):
         # 여기까지 왔으면 '옆으로 꽤 뻗은' 손가락이라고 간주
         if dx > 0:
             # 화면 오른쪽을 가리킴 ⇒ 로봇 에고 프레임 기준 "turn right"
-            return "turn right"
+            return "right"
         else:
-            return "turn left"
+            return "left"
 
     def run(self):
         if not self.cap.isOpened():
@@ -598,90 +395,96 @@ def _normalize_gesture_for_prompt(gesture: str | None) -> str:
     return "none"
 
 
-def query_chatgpt_action(client: OpenAI, model_name: str,
-                         frame_bgr, gesture, spoken_text):
+def query_chatgpt_action(
+    client: OpenAI,
+    model_name: str,
+    frame_bgr,
+    gesture,
+    spoken_text,
+    past_action,        # <==== ADD (list)
+    turn_satisfied,     # <==== ADD (string "true"/"false" or boolean)
+):
     """
-    - frame_bgr: 최신 카메라 RGB 관측 (BGR 포맷)
-    - gesture : "turn right" / "turn left" / None (초기 제스처)
-    - spoken_text: STT로 변환된 사람 발화 내용 (초기 instruction)
-
-    반환: (next_action, full_text)
-      - next_action ∈ ACTION_SPACE
-      - full_text  : ChatGPT가 생성한 전체 응답 문자열
+    input:
+      - frame_bgr, gesture, spoken_text, past_action(list), turn_satisfied("true"/"false")
+    output:
+      - next_action (str), reason (str)
     """
     t_total0 = time.perf_counter()
+
     if frame_bgr is None:
         print("[WARN] frame_bgr가 None → 안전하게 'stop' 반환")
-        return "stop", "[LLM] no frame_bgr (returned 'stop')"
+        return "stop", "No camera frame."
 
+    # --- encode image ---
     try:
-        if frame_bgr is None:
-            raise RuntimeError("frame_bgr is None")
-        
         frame_bgr = np.ascontiguousarray(frame_bgr, dtype=np.uint8)
-        ok, buf = cv2.imencode(
-            ".jpg",
-            frame_bgr,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
-        )
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         if not ok:
             raise RuntimeError("cv2.imencode failed")
-        
         data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
-      
     except Exception as e:
         print(f"[ERROR] 이미지 인코딩 실패 ({e}) → 'stop' 반환")
-        return "stop", "[LLM] jpeg encode failed (returned 'stop')"
+        return "stop", "JPEG encode failed."
 
-    # gesture가 아직 한 번도 인식 안된 경우 → "none"
     gesture_str = _normalize_gesture_for_prompt(gesture)
-    spoken_text = spoken_text or ""
+    spoken_text = (spoken_text or "").strip()
 
-    print(f"[DEBUG] ChatGPT spoken_text : {spoken_text}")
-    print(f"[DEBUG] ChatGPT gesture_str : {gesture_str}")
+    # past_action 길이가 너무 길어지면 LLM이 헷갈리니 최근 N개만 권장
+    past_action = past_action or []
+    past_action_tail = past_action[-10:]  # <==== RECOMMENDED: 최근 10개만
 
-    # system_instruction은 high-level role만 지정하고
-    # 상세 정책은 prompt.txt에 포함되어 있음
+    # turn_satisfied는 프롬프트 일관성을 위해 문자열 "true"/"false"로 통일 추천
+    if isinstance(turn_satisfied, bool):
+        turn_satisfied_str = "true" if turn_satisfied else "false"
+    else:
+        turn_satisfied_str = str(turn_satisfied).lower()
+        if turn_satisfied_str not in ("true", "false"):
+            turn_satisfied_str = "false"
+
+    print(f"[DEBUG] ChatGPT spoken_text    : {spoken_text}")
+    print(f"[DEBUG] ChatGPT gesture_str    : {gesture_str}")
+    print(f"[DEBUG] ChatGPT past_action    : {past_action_tail}")
+    print(f"[DEBUG] ChatGPT turn_satisfied : {turn_satisfied_str}")
+
+    # <==== CHANGED: JSON array로만 출력 강제
     system_instruction = (
-        "You are a navigation decision module for a mobile robot. "
-        "You must follow the prompt instructions and finally choose ONE action "
-        "from this action_space: forward, left, right, stop, goal. "
-        "In your answer, clearly state the final chosen action following the required format."
+        "You are a navigation decision module for a mobile robot.\n"
+        "You MUST follow the user's prompt instructions.\n"
+        "Return ONLY a valid JSON array with exactly 2 strings:\n"
+        '["<next_action>", "<reason>"]\n'
+        "Rules:\n"
+        "- <next_action> MUST be exactly one of: forward, left, right, stop, goal\n"
+        "- <reason> is a short explanation (1-3 sentences)\n"
+        "- Output ONLY the JSON array. No extra text, no markdown, no code block.\n"
     )
 
-    # --- 외부 텍스트 파일에서 템플릿 로드 ---
     template = load_prompt_template("prompt.txt")
 
-    # prompt.txt 안의 플레이스홀더를 실제 값으로 치환
+    # <==== CHANGED: prompt 템플릿에 새 placeholder 추가 (prompt.txt에도 반드시 넣어야 함)
     prompt = (
         template
         .replace("{spoken_text}", spoken_text)
         .replace("{gesture_str}", gesture_str)
+        .replace("{past_action}", json.dumps(past_action_tail, ensure_ascii=False))
+        .replace("{turn_satisfied}", turn_satisfied_str)
     )
 
     try:
         t_llm0 = time.perf_counter()
         resp = client.responses.create(
             model=model_name,
-            # 필요하면 reasoning/text 옵션 추가 가능
+            # temperature=0,  # <==== OPTIONAL: 결정 문제면 0 권장 (지원되면 켜세요)
             input=[
                 {
                     "role": "system",
-                    "content": [
-                        {"type": "input_text", "text": system_instruction}
-                    ],
+                    "content": [{"type": "input_text", "text": system_instruction}],
                 },
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt,
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": data_url,
-                        },
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url},
                     ],
                 },
             ],
@@ -689,33 +492,35 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
         t_llm1 = time.perf_counter()
     except Exception as e:
         print(f"[ERROR] ChatGPT API 호출 실패: {e} → 'stop' 반환")
-        return "stop", f"[LLM] ChatGPT API error ({e}) (returned 'stop')"
+        return "stop", f"ChatGPT API error: {e}"
 
     full_text = (resp.output_text or "").strip()
-    full_lower = full_text.lower()
 
-    # --- next_action 파싱 ---
-    # 1) 첫 줄 첫 토큰 우선
-    first_line = full_lower.splitlines()[0] if full_lower else ""
-    first_token = first_line.split()[0] if first_line else ""
+    # <==== NEW: JSON 파싱 (파싱 없애는 게 아니라, '항상 JSON만' 나오게 해서 파싱을 단순화)
+    next_action = "stop"
+    reason = "Failed to parse model output."
 
-    if first_token in ACTION_SPACE:
-        next_action = first_token
-    else:
-        # 2) 포함 여부라도 체크
-        next_action = None
-        for action in ACTION_SPACE:
-            if action in full_lower:
-                next_action = action
-                break
+    try:
+        arr = json.loads(full_text)
+        if isinstance(arr, list) and len(arr) == 2:
+            cand_action = str(arr[0]).strip().lower()
+            cand_reason = str(arr[1]).strip()
+            if cand_action in ACTION_SPACE:
+                next_action = cand_action
+                reason = cand_reason
+            else:
+                next_action = "stop"
+                reason = f"Invalid action token from model: {cand_action}"
+        else:
+            reason = f"Output is not a 2-element JSON array: {full_text}"
+    except Exception as e:
+        reason = f"JSON parse error: {e} | raw={full_text}"
 
-        # 3) 그래도 못 찾으면 stop
-        if next_action is None:
-            next_action = "stop"
     t_total1 = time.perf_counter()
     print(f"[TIME] LLM 답변 받는데만 걸린 시간: {(t_llm1 - t_llm0):.1f} s")
-    print(f"[TIME] 한번 예측에 걸린 총 시간 - total per-frame (encode+LLM+parse): {(t_total1 - t_total0):.1f} ms")
-    return next_action, full_text
+    print(f"[TIME] total per-frame (encode+LLM+parse): {(t_total1 - t_total0):.3f} s")
+
+    return next_action, reason
 
 
 # ==========================
@@ -796,6 +601,8 @@ def main():
     # 3-2) 6초 주기로 카메라 뷰 기반 next_action 업데이트
     # ==========================
     i=0
+    past_action = []          # <==== ADD: 처음엔 빈 리스트
+    turn_satisfied = "false"  # <==== ADD: 문자열로 통일 ("true"/"false")
     try:
         while True:
             frame_bgr = cam_thread.get_latest_frame()
@@ -803,24 +610,29 @@ def main():
             cv2.imwrite(f"./Hallway1/frame_{i}.jpg", frame_bgr)
 
             # next_action과 전체 LLM 응답을 모두 받음
-            next_action, llm_text = query_chatgpt_action(
+            next_action, reason = query_chatgpt_action(
                 client=client,
                 model_name=CHATGPT_MODEL_NAME,
                 frame_bgr=frame_bgr,
                 gesture=initial_gesture,
                 spoken_text=spoken_text_initial,
+                past_action=past_action,
+                turn_satisfied=turn_satisfied,
             )
 
-            print(f"[LOOP] 현재 제스처(실시간/동일): {gesture_now}")
             print(f"[RESULT] instruction    : {spoken_text_initial}")
-            print(f"[RESULT] initial_gesture: {initial_gesture}")
-            print(f"[RESULT] next_action    : {next_action}")
-            print("[RESULT] full LLM reply --------------------------------")
-            print(llm_text)
+            print(f"[RESULT] gesture: {initial_gesture}")
+            print(f"[RESULT] next_action: {next_action}")
+            print(f"[RESULT] reason: {reason}")
+            print(f"[STATE] past_action (tail): {past_action[-10:]}")
             print("--------------------------------------------------------")
-            print("-" * 60)
+            # 여기 if문으로 turn_satisfied 여부 검사하는 if문 넣어야함.
             i+=1
             #time.sleep(6.0)
+            past_action.append(next_action)
+            if turn_satisfied != "true":
+                if initial_gesture in past_action:
+                    turn_satisfied = "true"
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
