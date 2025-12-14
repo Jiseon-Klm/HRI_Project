@@ -3,7 +3,8 @@ import threading
 import time
 import re
 
-import whisper                         # ✅ STT용 Whisper
+# import whisper                         # ✅ STT용 Whisper
+from faster_whisper import WhisperModel
 from transformers import VitsModel, AutoTokenizer
 import sounddevice as sd               # (TTS에서만 사용)
 import numpy as np
@@ -19,6 +20,8 @@ from config import (
     OUTPUT_FILE,
     MODEL_NAME,          # ✅ 이거 꼭 필요
     LANG,
+    WHISPER_DEVICE,
+    WHISPER_COMPUTE_TYPE,
     GEMINI_API_KEY,
     GEMINI_MODEL_NAME,
     PROMPT_TEMPLATE,
@@ -39,7 +42,12 @@ class STTProcessor:
 
     def __init__(self, record_duration_sec: int = 5):
         print("[INFO] Whisper 모델 로딩 중...")
-        self.whisper_model = whisper.load_model(MODEL_NAME)
+        # ✅ Faster-Whisper 모델 로드
+        self.whisper_model = WhisperModel(
+            model_size_or_path=MODEL_NAME,
+            device=WHISPER_DEVICE,             # config.py에서 가져옴 (cpu)
+            compute_type=WHISPER_COMPUTE_TYPE  # config.py에서 가져옴 (int8)
+        )
         print("[INFO] 모델 로드 완료.")
 
         self.record_duration_sec = record_duration_sec
@@ -175,8 +183,18 @@ class STTProcessor:
         return OUTPUT_FILE
 
     def transcribe(self, audio_file):
-        print(f"[INFO] '{audio_file}' STT 처리 중...")
-        result = self.whisper_model.transcribe(audio_file, language=LANG, fp16=False)
-        text = result["text"].strip()
-        print(f"[INFO] STT 결과: {text}")
-        return text
+            print(f"[INFO] '{audio_file}' STT 처리 중...")
+            
+            # ✅ Faster-Whisper 추론
+            # segments는 generator라서 루프를 돌아야 텍스트가 나옵니다.
+            segments, info = self.whisper_model.transcribe(
+                audio_file, 
+                language=LANG,
+                beam_size=5  # 정확도를 위해 빔 사이즈 5 정도 추천
+            )
+            
+            # 쪼개진 문장(segment)들을 하나로 합치기
+            text = " ".join([segment.text for segment in segments]).strip()
+            
+            print(f"[INFO] STT 결과: {text}")
+            return text
