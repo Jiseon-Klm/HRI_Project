@@ -720,7 +720,7 @@ def main():
         while True:
             frame_bgr = cam_thread.get_latest_frame()
             gesture_now = cam_thread.get_gesture()  # freeze 이후엔 항상 initial_gesture와 동일
-            cv2.imwrite(f"frame_{i}.jpg", frame_bgr)
+            cv2.imwrite(f"./Hallway1/frame_{i}.jpg", frame_bgr)
 
             # next_action과 전체 LLM 응답을 모두 받음
             next_action, llm_text = query_chatgpt_action(
