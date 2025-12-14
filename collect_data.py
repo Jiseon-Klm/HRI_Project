@@ -39,7 +39,7 @@ def build_query(instruction: str, gesture: str, k: int) -> str:
         f"Gesture: {gesture}  # one of {{left,right,forward,none}}\n"
         "Task: Predict ONE action to execute for the NEXT ~2 seconds.\n"
         "Action space: {forward, left, right, stop, goal}\n"
-        "Output ONLY the action token.\n"
+        "Output ONLY the action token.Once the destination described in the user’s initial instruction has been reached, output exactly goal and nothing else.\n"
     )
 
 def main():
