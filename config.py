@@ -10,7 +10,8 @@ SILENCE_DURATION = 1.0
 OUTPUT_FILE = "speech.wav"
 MODEL_NAME = "medium" # Whisper 모델
 LANG = "ko" # 한국어
-
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE_TYPE = "int8"
 INPUT_DEVICE_ID = 1
 sd.default.device = (INPUT_DEVICE_ID, None)
 
