@@ -19,6 +19,7 @@ import subprocess
 import re
 import os
 import cv2
+import pyrealsense2 as rs
 import mediapipe as mp
 import numpy as np
 import base64
@@ -70,6 +71,64 @@ def load_prompt_template(path: str = "prompt.txt") -> str:
 # ==========================
 # 0) RealSense 카메라 열기
 # ==========================
+class RealSenseColorCap:
+    def __init__(self, width=640, height=480, fps=30, serial: str | None = None, timeout_ms=2000):
+        if rs is None:
+            raise RuntimeError("pyrealsense2 is not installed (rs is None)")
+
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.timeout_ms = timeout_ms
+
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        if serial:
+            self.config.enable_device(serial)
+
+        # ✅ 핵심: COLOR 스트림만 강제로 열기 (IR/Depth는 애초에 enable 안 함)
+        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+
+        self.profile = self.pipeline.start(self.config)
+        self._opened = True
+
+        # warm-up (auto exposure settle)
+        for _ in range(15):
+            frames = self.pipeline.wait_for_frames(timeout_ms)
+            _ = frames.get_color_frame()
+
+        # 추가 안전 확인: 실제로 color stream이 열렸는지 확인
+        color_stream = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+        if color_stream.format() != rs.format.bgr8:
+            # 이 케이스는 거의 없지만, 있으면 바로 fail 시켜서 문제를 빨리 드러내요
+            raise RuntimeError(f"Color stream format is not BGR8: {color_stream.format()}")
+
+    def isOpened(self):
+        return self._opened
+
+    def read(self):
+        if not self._opened:
+            return False, None
+        try:
+            frames = self.pipeline.wait_for_frames(self.timeout_ms)
+            color = frames.get_color_frame()
+            if not color:
+                return False, None
+            frame_bgr = np.asanyarray(color.get_data())  # 이미 BGR8
+            if frame_bgr is None or frame_bgr.size == 0:
+                return False, None
+            return True, frame_bgr
+        except Exception:
+            return False, None
+
+    def release(self):
+        if self._opened:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            self._opened = False
+
 def open_realsense_capture():
     """
     RealSense 카메라를 robust하게 여는 함수.
@@ -94,6 +153,17 @@ def open_realsense_capture():
       - index    : /dev/videoX 의 X
       - dev_path : "/dev/videoX"
     """
+    print("[INFO] RealSense 카메라 오픈: 1) pyrealsense2 color stream 우선 시도")
+
+    # <==== ADD: Deterministic path (no IR confusion)
+    if rs is not None:
+        try:
+            cap = RealSenseColorCap(width=640, height=480, fps=30, serial=None)
+            # index/dev_path는 더 이상 의미 없지만, 기존 반환 형식을 맞추기 위해 더미로 채움
+            return cap, -1, "realsense:color(bgr8)"
+        except Exception as e:
+            print(f"[WARN] pyrealsense2 color stream 오픈 실패 -> V4L2 fallback: {e}")
+
     print("[INFO] RealSense 카메라 자동 탐색: `v4l2-ctl --list-devices` 실행")
 
     # --------------------------------------------------
