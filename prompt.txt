@@ -245,7 +245,7 @@ Always follow this exact format:
 
 - First line: ONLY the chosen action token:
     one of "forward", "left", "right", "stop", or "goal".
-- After that, you may explain your reasoning.
+- After that, you explain your reasoning.
 
 Concretely:
 
