@@ -71,7 +71,71 @@ class STTProcessor:
 
         self.silence_threshold = self.base_noise * 3.5
         print(f"[INFO] base_noise(RMS)={self.base_noise:.6f}, silence_threshold={self.silence_threshold:.6f}")
-        
+
+    def _detect_respeaker_card_device(self):
+        """
+        arecord -l 출력 예:
+
+        card 1: ArrayUAC10 [ReSpeaker 4 Mic Array (UAC1.0)], device 0: USB Audio [USB Audio]
+          Subdevices: 1/1
+          Subdevice #0: subdevice #0
+        card 3: Generic_1 [HD-Audio Generic], device 0: ALC1220 Analog [ALC1220 Analog]
+
+        여기서 'ReSpeaker', 'ArrayUAC10', 'Mic Array', 'USB Audio' 같은 키워드가
+        포함된 라인에서 card / device 번호를 뽑는다.
+        """
+        print("[INFO] ReSpeaker ALSA 디바이스 자동 탐색: `arecord -l` 실행")
+
+        try:
+            proc = subprocess.run(
+                ["arecord", "-l"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+        except Exception as e:
+            raise RuntimeError(f"[ERROR] `arecord -l` 실행 실패: {e}")
+
+        output_lines = proc.stdout.splitlines()
+
+        preferred_keywords = [
+            "ReSpeaker",
+            "ArrayUAC10",
+            "Mic Array",
+            "USB Audio",
+        ]
+
+        candidate = None
+
+        for line in output_lines:
+            line = line.strip()
+            if not line.startswith("card "):
+                continue
+
+            # ReSpeaker 관련 키워드가 포함된 card 라인만 필터링
+            if not any(kw in line for kw in preferred_keywords):
+                continue
+
+            # 예: "card 1: ArrayUAC10 [...], device 0: USB Audio [...]"
+            m = re.search(r"card\s+(\d+):.*device\s+(\d+):", line)
+            if m:
+                card = int(m.group(1))
+                dev = int(m.group(2))
+                candidate = (card, dev)
+                print(f"[INFO] ReSpeaker 후보 디바이스 발견: card={card}, device={dev}, line='{line}'")
+                break
+
+        if candidate is None:
+            # 진짜 ReSpeaker가 안 붙어 있으면 여기서 에러
+            raise RuntimeError(
+                "[ERROR] `arecord -l` 출력에서 ReSpeaker 디바이스를 찾지 못했습니다.\n"
+                "ReSpeaker가 제대로 연결되어 있는지, 컨테이너에 /dev/snd 가 마운트되어 있는지,\n"
+                "`arecord -l` 출력에 'ReSpeaker 4 Mic Array (UAC1.0)' 가 보이는지 확인하세요."
+            )
+
+        return candidate
+
     def _map_alsa_card_to_sounddevice_id(self, card: int, dev: int) -> int:
         """
         arecord -l로 얻은 (card, dev)을 sounddevice(PortAudio) 입력 장치 id로 매핑.
@@ -140,47 +204,6 @@ class STTProcessor:
     # -------------------------
     # Device detect
     # -------------------------
-    def _detect_respeaker_input_device_id(self):
-        """
-        sounddevice(PortAudio) 입력 장치 목록에서 ReSpeaker를 찾아 device index를 반환.
-        실패하면 기본 입력 장치로 fallback.
-        """
-        preferred_keywords = [
-            "respeaker",
-            "arrayuac",
-            "mic array",
-            "uac1",
-            "usb audio",
-        ]
-
-        devices = sd.query_devices()
-        candidates = []
-
-        for idx, d in enumerate(devices):
-            if d.get("max_input_channels", 0) <= 0:
-                continue
-            name = (d.get("name", "") or "").lower()
-            score = sum(1 for kw in preferred_keywords if kw in name)
-            if score > 0:
-                candidates.append((score, idx, d.get("name", "")))
-
-        if candidates:
-            candidates.sort(reverse=True, key=lambda x: x[0])
-            score, idx, name = candidates[0]
-            print(f"[INFO] ReSpeaker 후보 선택: idx={idx}, score={score}, name='{name}'")
-            return idx
-
-        # fallback
-        try:
-            default_in = sd.default.device[0]  # (input, output)
-            if default_in is None:
-                raise RuntimeError("sd.default.device[0] is None")
-            print(f"[WARN] ReSpeaker를 못 찾아 기본 입력 장치 사용: {default_in}")
-            return default_in
-        except Exception as e:
-            print(f"[WARN] 기본 입력 장치 조회 실패: {e} → device_id=0 사용")
-            return 0
-
     # -------------------------
     # Noise measure
     # -------------------------
@@ -338,7 +361,7 @@ class STTProcessor:
 
         # OUTPUT_FILE 저장 (float32 → int16)
         audio_int16 = np.int16(np.clip(audio_data, -1.0, 1.0) * 32767)
-        sf.write(OUTPUT_FILE, audio_int16, SAMPLE_RATE, subtype="PCM_16")
+        sf.write(OUTPUT_FILE, audio_int16, SAMPLE_RATE, subtype="PCM_16", format="WAV")
         print(f"[INFO] 녹음 완료(VAD): {OUTPUT_FILE}")
         return OUTPUT_FILE
 
