@@ -588,6 +588,7 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
     )
 
     try:
+        t_llm0 = time.perf_counter()
         resp = client.responses.create(
             model=model_name,
             # 필요하면 reasoning/text 옵션 추가 가능
@@ -613,6 +614,7 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
                 },
             ],
         )
+        t_llm1 = time.perf_counter()
     except Exception as e:
         print(f"[ERROR] ChatGPT API 호출 실패: {e} → 'stop' 반환")
         return "stop", f"[LLM] ChatGPT API error ({e}) (returned 'stop')"
@@ -638,7 +640,7 @@ def query_chatgpt_action(client: OpenAI, model_name: str,
         # 3) 그래도 못 찾으면 stop
         if next_action is None:
             next_action = "stop"
-
+    print(f"[TIME] LLM round-trip (responses.create): {(t_llm1 - t_llm0)*1000:.1f} ms")
     return next_action, full_text
 
 
@@ -681,13 +683,17 @@ def main():
     try:
         while True:
             print("\n[MAIN] 초기 instruction 발화를 기다리는 중... (ReSpeaker로 말해줘)")
+            
             audio_path = stt.listen_once(volume_level_changed=dummy_volume)
+            
 
             if audio_path is None:
                 print("[MAIN] 녹음된 오디오가 없음, 다시 대기")
                 continue
-
+            t_stt0 = time.perf_counter() 
             spoken_text = stt.transcribe(audio_file=audio_path).strip()
+            t_stt1 = time.perf_counter()
+            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0)*1000:.1f} ms")
             if not spoken_text:
                 print("[MAIN] STT 결과가 비어 있음, 다시 대기")
                 continue
