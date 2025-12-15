@@ -5,14 +5,17 @@ xhost +local:docker
 
 # 실행
 docker run -it --rm \
-    --net=host \
-    --privileged \
-    -v /dev/bus/usb:/dev/bus/usb \
-    -v /tmp/.X11-unix:/tmp/.X11-unix \
-    -v /home/aprl/Desktop/hri:/ros2_ws/ws \
-    --device /dev/snd:/dev/snd \
-    -e DISPLAY=$DISPLAY \
-    hri_project
+  --net=host \
+  --privileged \
+  --device /dev/snd \
+  --group-add audio \
+  -v /dev/bus/usb:/dev/bus/usb \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v /home/aprl/Desktop/hri:/ros2_ws/ws \
+  -e DISPLAY=$DISPLAY \
+  -e PULSE_SERVER=unix:/run/user/1000/pulse/native \
+  -v /run/user/1000/pulse:/run/user/1000/pulse \
+  jsk_hri
 
 # main 실행
 python3 hint_task.py
