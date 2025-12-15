@@ -12,7 +12,8 @@ gesture_nav_agent.py
   action_space = ["forward", "left", "right", "stop", "goal"] 중
   next_action을 계속 업데이트해서 터미널에 출력.
 """
-
+from collections import deque
+from queue import Queue, Empty
 import threading
 import time
 import subprocess
@@ -379,6 +380,91 @@ class GestureCamera(threading.Thread):
         print("[INFO] GestureCamera 쓰레드 종료")
 
 
+class AsyncFrameSamplerSaver(threading.Thread):
+    """
+    - 매 interval_sec마다 cam_thread의 latest frame을 복사해서 queue에 넣고
+    - queue에서 받아 JPEG 저장 + 최근 3장(순서 보장) ring buffer(deque) 업데이트
+    - 메인 루프는 get_last_k(3)로 최근 3장을 즉시 가져오기만 하면 됨 (가벼움)
+    """
+    def __init__(self, cam_thread: GestureCamera,
+                 save_dir: str,
+                 interval_sec: float = 2.0,
+                 jpg_quality: int = 90,
+                 keep_k: int = 3):
+        super().__init__(daemon=True)
+        self.cam_thread = cam_thread
+        self.save_dir = save_dir
+        self.interval_sec = interval_sec
+        self.jpg_quality = jpg_quality
+        self.keep_k = keep_k
+
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        self._q = Queue(maxsize=8)   # 너무 커지면 backpressure (메모리 폭주 방지)
+        self._running = True
+        self._lock = threading.Lock()
+        self._buf = deque(maxlen=keep_k)  # [(path, pil_img), ...]
+
+        self._idx = 0
+
+    def stop(self):
+        self._running = False
+
+    def get_last_k(self, k: int = 3):
+        """최근 k장의 (path, pil_img) 리스트를 오래된->최신 순으로 반환"""
+        with self._lock:
+            items = list(self._buf)
+        if len(items) >= k:
+            return items[-k:]
+        return items  # 아직 k장 안 모였으면 있는 만큼만
+
+    def run(self):
+        next_t = time.perf_counter()
+        while self._running:
+            # 1) 2초마다 최신 프레임을 "복사해서" 큐에 넣기 (가벼움)
+            now = time.perf_counter()
+            if now >= next_t:
+                frame = self.cam_thread.get_latest_frame()
+                if frame is not None:
+                    try:
+                        # copy는 이미 get_latest_frame에서 copy라서 추가 copy 불필요하지만 안전하게 두려면 .copy()
+                        self._q.put(frame, timeout=0.1)
+                    except Exception:
+                        pass
+                next_t += self.interval_sec
+
+            # 2) 큐에서 프레임 꺼내서 저장 + 버퍼 업데이트 (여기가 비용 큰 부분, 메인과 분리됨)
+            try:
+                frame_bgr = self._q.get(timeout=0.02)
+            except Empty:
+                continue
+
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self._idx += 1
+            fname = f"frame_{ts}_{self._idx:06d}.jpg"
+            fpath = os.path.join(self.save_dir, fname)
+
+            # JPEG 저장 (OpenCV)
+            try:
+                cv2.imwrite(fpath, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpg_quality])
+            except Exception:
+                # 저장 실패해도 버퍼는 계속 굴러가게
+                fpath = ""
+
+            # PIL(=VLM 입력용) 변환은 여기서 1번만 해두면 메인 루프가 가벼워짐
+            try:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(frame_rgb)
+            except Exception:
+                pil_img = None
+
+            with self._lock:
+                if pil_img is not None:
+                    self._buf.append((fpath, pil_img))
+
+        # drain optional
+
+
 # ==========================
 # 2) Gemini로 액션 결정 (초기 gesture/instruction 사용)
 # ==========================
@@ -555,107 +641,66 @@ def load_local_qwen_vlm(model_dir: str):
 
 #     return next_action, reason
 
-def query_local_qwen_action(processor, model, frame_bgr, gesture, spoken_text):
+def query_local_qwen_action(processor, model, pil_imgs, gesture, spoken_text):
     """
-    로컬 Qwen3-VL로 (prompt + image) 넣고 generate 결과를 JSON으로 파싱.
-    output: (next_action, reason)
+    pil_imgs: [PIL.Image, PIL.Image, PIL.Image] (오래된 -> 최신 순)
+    return: next_action (str)
     """
-    t_total0 = time.perf_counter()
+    if not pil_imgs or len(pil_imgs) == 0:
+        return "stop"
 
-    if frame_bgr is None:
-        return "stop", "No camera frame."
-
-    # 1) image: BGR(np) -> RGB(PIL)
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(frame_rgb)
-
-    # 2) prompt 만들기 (너의 prompt.txt 그대로 재사용)
     gesture_str = _normalize_gesture_for_prompt(gesture)
     spoken_text = (spoken_text or "").strip()
 
-    # past_action = past_action or []
-    # past_action_tail = past_action[-10:]
-
-    if isinstance(turn_satisfied, bool):
-        turn_satisfied_str = "true" if turn_satisfied else "false"
-    else:
-        turn_satisfied_str = str(turn_satisfied).lower()
-        if turn_satisfied_str not in ("true", "false"):
-            turn_satisfied_str = "false"
-
     template = load_prompt_template("prompt.txt")
-    prompt = (
-        template
-        .replace("{spoken_text}", spoken_text)
-        .replace("{gesture_str}", gesture_str)
-        # .replace("{past_action}", json.dumps(past_action_tail, ensure_ascii=False))
-        # .replace("{turn_satisfied}", turn_satisfied_str)
-    )
 
-    # 3) “JSON만 출력” 강제 (너가 ChatGPT 때 쓰던 정책 그대로 유지)
+    # ✅ 학습 포맷 최대한 맞추기: <image> 토큰을 K번 붙이고 줄바꿈
+    k = len(pil_imgs)
+    prompt = (("<image>" * k) + "\n" +
+              template.replace("{spoken_text}", spoken_text)
+                      .replace("{gesture_str}", gesture_str))
+
     system_instruction = (
-        "You are a navigation decision module for a mobile robot.\n"
-        "Return ONLY ONE token as the action.\n"
-        "The action MUST be exactly one of: forward, left, right, stop, goal\n"
-        "No extra words, no punctuation, no JSON.\n"
+        "You are a short-horizon navigation policy for a mobile robot.\n"
+        "Output ONLY one token among: forward, left, right, stop, goal\n"
     )
 
-
-    # 4) Qwen-VL 계열은 chat template 기반으로 input text를 만들면 가장 안전해요.
     messages = [
         {"role": "system", "content": system_instruction},
         {"role": "user", "content": prompt},
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    # 5) Processor로 text+image를 텐서로 패킹
     inputs = processor(
         text=[text],
-        images=[pil_img],
+        images=pil_imgs,              # ✅ 3장 그대로 넣기
         return_tensors="pt",
     )
 
-    # device로 이동
-    if LOCAL_DEVICE.startswith("cuda"):
+    if torch.cuda.is_available():
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
-    # CPU면 그대로 둠
 
-    # 6) generate
     try:
-        t_llm0 = time.perf_counter()
         with torch.inference_mode():
-            if LOCAL_DEVICE.startswith("cuda"):
-                with torch.autocast(device_type="cuda", dtype=LOCAL_DTYPE):
-                    out = model.generate(
-                        **inputs,
-                        max_new_tokens=64,
-                        do_sample=False,   # greedy
-                    )
-            else:
-                out = model.generate(
-                    **inputs,
-                    max_new_tokens=64,
-                    do_sample=False,
-                )
-        t_llm1 = time.perf_counter()
+            out = model.generate(
+                **inputs,
+                max_new_tokens=8,
+                do_sample=False,
+            )
     except Exception as e:
-        return "stop", f"Local VLM generate error: {e}"
+        print("[ERROR] Local VLM generate error:", e)
+        return "stop"
 
-    # 7) decode: 프롬프트 길이 이후만 잘라서 모델 답만 뽑기
-    # inputs["input_ids"] shape: (1, prompt_len)
     prompt_len = inputs["input_ids"].shape[1]
     gen_ids = out[0][prompt_len:]
     full_text = processor.decode(gen_ids, skip_special_tokens=True).strip()
 
-    # 액션만 뽑기: 공백/개행/따옴표/대괄호 등 방어
     cand = re.split(r"\s+", full_text)[0]
-    cand = cand.strip().strip('"\'' ).strip("[](),.")
-    
+    cand = cand.strip().strip('"\'').strip("[](),.")
+
     if cand not in ACTION_SPACE:
-        # 모델이 잡소리 섞으면 안전하게 stop
         print(f"[WARN] invalid action output: raw='{full_text}' -> cand='{cand}'")
         return "stop"
-    
     return cand
 
 # ==========================
@@ -684,6 +729,16 @@ def main():
     # 1) 제스처 카메라 쓰레드 시작 (이미 열린 cap을 넘김)
     cam_thread = GestureCamera(cap=cap)
     cam_thread.start()
+  
+    # ✅ 2초마다 프레임 저장/버퍼링 쓰레드 시작
+    sampler = AsyncFrameSamplerSaver(
+        cam_thread=cam_thread,
+        save_dir="./log",     # 네가 원하던 저장 폴더
+        interval_sec=2.0,
+        jpg_quality=90,
+        keep_k=3,
+    )
+    sampler.start()
 
     # 2) STT 준비 (ReSpeaker 입력, 초기 한 번만 사용)
     stt = STTProcessor()
@@ -744,19 +799,20 @@ def main():
     # turn_satisfied = "false"  # <==== ADD: 문자열로 통일 ("true"/"false")
     try:
         while True:
-            frame_bgr = cam_thread.get_latest_frame()
-            gesture_now = cam_thread.get_gesture()  # freeze 이후엔 항상 initial_gesture와 동일
-            cv2.imwrite(f"./Hallway1/frame_{i}.jpg", frame_bgr)
+            # frame_bgr = cam_thread.get_latest_frame()
+            # gesture_now = cam_thread.get_gesture()  # freeze 이후엔 항상 initial_gesture와 동일
+            # cv2.imwrite(f"./Hallway1/frame_{i}.jpg", frame_bgr)
 
+            items = sampler.get_last_k(3)
+            pil_imgs = [pil for (_, pil) in items]   # 3장
+          
             # next_action과 전체 LLM 응답을 모두 받음
             next_action = query_local_qwen_action(
                 processor=processor,
                 model=local_model,
-                frame_bgr=frame_bgr,
+                pil_imgs=pil_imgs,
                 gesture=initial_gesture,
                 spoken_text=spoken_text_initial,
-                past_action=past_action,
-                turn_satisfied=turn_satisfied,
             )
 
             print(f"[RESULT] instruction    : {spoken_text_initial}")
@@ -775,6 +831,7 @@ def main():
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
 
     finally:
+        sampler.stop()
         cam_thread.stop()
         cam_thread.join()
         print("[INFO] 종료 완료")
