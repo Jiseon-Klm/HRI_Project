@@ -31,7 +31,7 @@ from config import (
     MMS_TTS_OUTPUT_FILE,
 )
 # ================== STT (Speech-to-Text) ==================
-
+os.environ["COQUI_TOS_AGREED"] = "1"
 class STTProcessor:
     """
     - 처음 생성될 때 `arecord -l` 결과에서
