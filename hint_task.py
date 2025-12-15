@@ -545,9 +545,11 @@ def main():
     # 2) STT 준비 (ReSpeaker 입력, 초기 한 번만 사용)
     stt = STTProcessor()
     tts = TTSProcessorPiper(
-        model_path="./piper_models/ko_KR-model.onnx",   # <== 네 모델 파일
-        config_path="./piper_models/ko_KR-model.onnx.json"  # <== 있으면 넣고, 없으면 None
+        model_path="/ros2_ws/ws/voices/ko/piper-kss-korean.onnx",
+        config_path="/ros2_ws/ws/voices/ko/piper-kss-korean.onnx.json",
+        piper_bin="piper",
     )
+
 
     dummy_volume = DummyVolumeSignal()
 
