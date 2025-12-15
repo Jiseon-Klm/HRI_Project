@@ -2,7 +2,8 @@ import subprocess
 import threading
 import time
 import re
-
+import os
+import tempfile
 # import whisper                         # ✅ STT용 Whisper
 from faster_whisper import WhisperModel
 from transformers import VitsModel, AutoTokenizer
@@ -212,3 +213,36 @@ class STTProcessor:
             
             print(f"[INFO] STT 결과: {text}")
             return text
+
+
+
+class TTSProcessorXTTS:
+    def __init__(self, reference_wav: str, device: str = "cuda"):
+        """
+        reference_wav: 너 목소리/원하는 톤의 wav (짧아도 됨)
+        device: "cuda" 권장 (Jetson/데스크탑 GPU). CPU면 "cpu"
+        """
+        from TTS.api import TTS  # coqui-tts
+
+        if not os.path.exists(reference_wav):
+            raise FileNotFoundError(f"reference wav not found: {reference_wav}")
+
+        self.reference_wav = reference_wav
+        self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+
+    def speak(self, text: str, out_wav: str | None = None):
+        if out_wav is None:
+            fd, out_wav = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+
+        # 핵심: speaker_wav로 레퍼런스 음성 넣기
+        self.tts.tts_to_file(
+            text=text,
+            speaker_wav=self.reference_wav,
+            file_path=out_wav,
+            language="ko",
+        )
+
+        # 재생: 도커/리눅스면 aplay가 제일 단순하고 안정적
+        subprocess.run(["aplay", "-q", out_wav], check=False)
+        return out_wav
