@@ -244,6 +244,7 @@ class TTSProcessorPiper:
         self.config_path = config_path
         self.piper_bin = piper_bin
         self.sample_rate = sample_rate
+
     def _find_pulse_sink_by_description(self, target_desc: str) -> str | None:
         """
         PulseAudio/PipeWire sink 중에서 Description(혹은 device.description)에
@@ -318,13 +319,36 @@ class TTSProcessorPiper:
         # 2) paplay 없으면 aplay fallback (BT에서는 보통 실패)
         print("[WARN] paplay not found. Falling back to aplay (may fail for Bluetooth).")
         subprocess.run(["aplay", "-q", wav_path], check=False)
+    
+    def _convert_wav_for_bt(self, in_wav: str, out_wav: str):
+        # ffmpeg 필요 (없으면 Dockerfile에 ffmpeg 설치)
+        if shutil.which("ffmpeg") is None:
+            print("[WARN] ffmpeg not found; skip conversion")
+            return in_wav
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", in_wav,
+            "-ar", "48000",      # 48kHz
+            "-ac", "2",          # stereo
+            "-sample_fmt", "s16",
+            out_wav
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return out_wav
 
     def speak(self, text: str, out_wav: str | None = None):
+        """
+        - piper로 wav 생성
+        - 생성 wav 메타(sr/ch) 로깅
+        - (BT 괴음 방지) 가능하면 ffmpeg로 48kHz/2ch/s16로 변환한 wav를 재생
+        - paplay로 특정 BT sink(Description 매칭)로 출력
+        """
         if out_wav is None:
             fd, out_wav = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
 
-        # Piper: stdin으로 텍스트 넣고 wav 출력
+        # 1) Piper: stdin으로 텍스트 넣고 wav 출력
         cmd = [
             self.piper_bin,
             "--model", self.model_path,
@@ -339,15 +363,54 @@ class TTSProcessorPiper:
             check=True,
         )
 
-
-        # ✅ 여기부터 디버깅 출력 넣기 (out_wav가 존재하는 스코프)
+        # 2) 생성된 wav 메타 확인
         print(f"[TTS] using model={self.model_path}")
         print(f"[TTS] using config={self.config_path}")
+
         try:
             data, sr = sf.read(out_wav)
-            print(f"[TTS] wav sr={sr}, shape={getattr(data, 'shape', None)}")
+            shape = getattr(data, "shape", None)
+            rms = float(np.sqrt(np.mean(np.square(data)))) if data is not None else None
+            print(f"[TTS] raw wav sr={sr}, shape={shape}, rms={rms:.6f}")
         except Exception as e:
             print(f"[WARN] failed to read generated wav: {e}")
-    
-        self._play_wav(out_wav, prefer_sink_desc="Mi Portable BT Speaker 16W")
-        return out_wav
+
+        # 3) (중요) BT에서 괴음 방지: 48kHz/2ch/s16로 강제 변환해서 재생
+        play_wav = out_wav
+        try:
+            if shutil.which("ffmpeg") is not None:
+                bt_wav = out_wav[:-4] + ".bt.wav" if out_wav.lower().endswith(".wav") else out_wav + ".bt.wav"
+                conv_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", out_wav,
+                    "-ar", "48000",      # BT(A2DP)에서 안정적인 편
+                    "-ac", "2",          # stereo로 맞춤
+                    "-sample_fmt", "s16",
+                    bt_wav
+                ]
+                subprocess.run(
+                    conv_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+
+                # 변환 성공/유효성 간단 체크
+                if os.path.exists(bt_wav) and os.path.getsize(bt_wav) > 44:
+                    try:
+                        _, sr2 = sf.read(bt_wav)
+                        print(f"[TTS] converted wav -> {bt_wav} (sr={sr2})")
+                    except Exception:
+                        print(f"[TTS] converted wav -> {bt_wav}")
+                    play_wav = bt_wav
+                else:
+                    print("[WARN] ffmpeg conversion failed or produced invalid file. Using raw wav.")
+            else:
+                print("[WARN] ffmpeg not found. Using raw wav (BT may sound weird).")
+        except Exception as e:
+            print(f"[WARN] conversion step failed: {e}. Using raw wav.")
+
+        # 4) 재생 (BT sink Description 매칭)
+        self._play_wav(play_wav, prefer_sink_desc="Mi Portable BT Speaker 16W")
+        return play_wav
+
