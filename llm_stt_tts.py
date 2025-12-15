@@ -230,12 +230,20 @@ class STTProcessor:
 
 
 class TTSProcessorPiper:
-    def __init__(self,
-                 model_path: str,
-                 config_path: str,
-                 piper_bin: str = "piper",
-                 sample_rate: int = 22050,
-                 pulse_sink_name: str | None = None):
+    """
+    ✅ Piper로 wav 생성 -> sounddevice로 즉시 재생 (ALSA 직결)
+    - paplay/pactl/pipewire/bt 전부 제거
+    - 지연 최소 + 컨테이너에서 가장 잘 됨
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        config_path: str,
+        piper_bin: str = "piper",
+        force_out_sr: int = 48000,      # ✅ 대부분 ALSA/HDMI가 48k를 좋아함
+        output_device: str | int | None = None,  # ✅ 이름(부분문자열) 또는 index
+    ):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"piper model not found: {model_path}")
         if not os.path.exists(config_path):
@@ -244,202 +252,79 @@ class TTSProcessorPiper:
         self.model_path = model_path
         self.config_path = config_path
         self.piper_bin = piper_bin
-        self.sample_rate = sample_rate
+        self.force_out_sr = force_out_sr
 
-        # ✅ BT sink를 description으로 찾지 말고 이름으로 강제
-        # 환경변수로도 override 가능하게
-        self.pulse_sink_name = (
-            os.environ.get("PULSE_SINK")
-            or pulse_sink_name
-            or "bluez_output.08_EB_ED_6E_45_1A.1"
-        )
+        # 환경변수로도 바로 바꿀 수 있게
+        # 예: export SD_OUTPUT_DEVICE="hdmi"  또는 "2"
+        env_dev = os.environ.get("SD_OUTPUT_DEVICE")
+        if output_device is None and env_dev:
+            # 숫자면 index로
+            if env_dev.isdigit():
+                output_device = int(env_dev)
+            else:
+                output_device = env_dev
 
-    def _find_pulse_sink_by_description(self, target_desc: str) -> str | None:
-        """
-        PulseAudio/PipeWire sink 중에서 Description(혹은 device.description)에
-        target_desc가 포함된 sink의 'Name'을 찾아 반환.
-        예: bluez_output.XX_XX_...a2dp-sink
-        """
-        if shutil.which("pactl") is None:
-            print("[WARN] pactl not found. Install pulseaudio-utils in Dockerfile.")
-            return None
+        self.output_device = output_device
 
-        try:
-            proc = subprocess.run(
-                ["pactl", "list", "sinks"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=True,
-            )
+    def _pick_device_index(self, device_query: str | int | None):
+        if device_query is None:
+            return None  # default device
 
-        except Exception as e:
-            print(f"[WARN] pactl list sinks failed: {e}")
-            return None
+        if isinstance(device_query, int):
+            return device_query
 
-        text = proc.stdout
-        blocks = text.split("Sink #")
-        target = target_desc.lower()
+        # 문자열이면 "이름 부분매칭"으로 output device 찾기
+        q = device_query.lower()
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d["max_output_channels"] > 0 and q in d["name"].lower():
+                return i
 
-        for b in blocks:
-            # sink name 라인 찾기: "Name: xxx"
-            m_name = re.search(r"^\s*Name:\s*(.+)$", b, flags=re.MULTILINE)
-            if not m_name:
-                continue
-            sink_name = m_name.group(1).strip()
-
-            # description 후보들
-            desc_candidates = []
-            m_desc = re.search(r"^\s*Description:\s*(.+)$", b, flags=re.MULTILINE)
-            if m_desc:
-                desc_candidates.append(m_desc.group(1).strip())
-            # PipeWire에서는 properties 안에 device.description이 있는 경우도 많아요
-            m_devdesc = re.search(r"device\.description\s*=\s*\"(.+?)\"", b)
-            if m_devdesc:
-                desc_candidates.append(m_devdesc.group(1).strip())
-
-            joined = " | ".join(desc_candidates).lower()
-            if target in joined:
-                return sink_name
-
+        print(f"[WARN] sounddevice output device '{device_query}' not found. Using default.")
         return None
-    
-    def _play_wav(self, wav_path: str):
-        """
-        ✅ 무조건 지정 sink로 출력한다.
-        - 실패하면 즉시 원인을 드러내기 위해 에러를 출력한다.
-        """
-        if shutil.which("paplay") is None:
-            raise RuntimeError("paplay not found (install pulseaudio-utils).")
 
-        # sink 존재 여부 체크 (pactl이 안 되면 Pulse 서버 연결 자체가 깨진 것)
-        if shutil.which("pactl") is None:
-            raise RuntimeError("pactl not found (install pulseaudio-utils).")
-
-        try:
-            proc = subprocess.run(
-                ["pactl", "list", "short", "sinks"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"pactl failed (Pulse/PipeWire not reachable from container): {e}")
-
-        if self.pulse_sink_name not in proc.stdout:
-            raise RuntimeError(
-                f"Target sink '{self.pulse_sink_name}' not visible.\n"
-                f"pactl list short sinks:\n{proc.stdout}"
-            )
-
-        # ✅ 여기서부터 실제 재생
-        r = subprocess.run(
-            ["paplay", "--device", self.pulse_sink_name, wav_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"paplay failed (sink={self.pulse_sink_name}). Output:\n{r.stdout}"
-            )
-
-
-    
-    def _convert_wav_for_bt(self, in_wav: str, out_wav: str):
-        # ffmpeg 필요 (없으면 Dockerfile에 ffmpeg 설치)
-        if shutil.which("ffmpeg") is None:
-            print("[WARN] ffmpeg not found; skip conversion")
-            return in_wav
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", in_wav,
-            "-ar", "44100",      # 48kHz
-            "-ac", "2",          # stereo
-            "-sample_fmt", "s16",
-            out_wav
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        return out_wav
+    def _resample_linear(self, x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+        if sr_in == sr_out:
+            return x
+        # 간단 선형 보간 (지연 최소, 의존성 0)
+        n_in = x.shape[0]
+        n_out = int(round(n_in * (sr_out / sr_in)))
+        xp = np.linspace(0.0, 1.0, n_in, endpoint=False)
+        fp = x.astype(np.float32)
+        xq = np.linspace(0.0, 1.0, n_out, endpoint=False)
+        y = np.interp(xq, xp, fp).astype(np.float32)
+        return y
 
     def speak(self, text: str, out_wav: str | None = None):
-        """
-        - piper로 wav 생성
-        - 생성 wav 메타(sr/ch) 로깅
-        - (BT 괴음 방지) 가능하면 ffmpeg로 48kHz/2ch/s16로 변환한 wav를 재생
-        - paplay로 특정 BT sink(Description 매칭)로 출력
-        """
         if out_wav is None:
             fd, out_wav = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
 
-        # 1) Piper: stdin으로 텍스트 넣고 wav 출력
+        # 1) Piper로 wav 생성
         cmd = [
             self.piper_bin,
             "--model", self.model_path,
             "--config", self.config_path,
             "--output_file", out_wav,
         ]
+        subprocess.run(cmd, input=(text.strip() + "\n"), text=True, check=True)
 
-        subprocess.run(
-            cmd,
-            input=(text.strip() + "\n"),
-            text=True,
-            check=True,
-        )
+        # 2) wav 읽기
+        audio, sr = sf.read(out_wav, dtype="float32")
+        if audio.ndim == 2:
+            # piper는 보통 mono지만 혹시 몰라서 mono로 다운믹스
+            audio = audio.mean(axis=1)
 
-        # 2) 생성된 wav 메타 확인
-        print(f"[TTS] using model={self.model_path}")
-        print(f"[TTS] using config={self.config_path}")
+        # 3) (권장) output SR로 리샘플
+        audio_play = self._resample_linear(audio, sr_in=sr, sr_out=self.force_out_sr)
 
+        # 4) sounddevice로 재생 (ALSA 직결)
+        dev_index = self._pick_device_index(self.output_device)
         try:
-            data, sr = sf.read(out_wav)
-            shape = getattr(data, "shape", None)
-            rms = float(np.sqrt(np.mean(np.square(data)))) if data is not None else None
-            print(f"[TTS] raw wav sr={sr}, shape={shape}, rms={rms:.6f}")
+            sd.play(audio_play, samplerate=self.force_out_sr, device=dev_index, blocking=True)
         except Exception as e:
-            print(f"[WARN] failed to read generated wav: {e}")
+            print(f"[ERROR] sounddevice play failed: {e}")
+            print("[HINT] sd.query_devices()로 출력 디바이스 이름/인덱스 확인 후 SD_OUTPUT_DEVICE를 지정해봐요.")
+            raise
 
-        # 3) (중요) BT에서 괴음 방지: 48kHz/2ch/s16로 강제 변환해서 재생
-        play_wav = out_wav
-        try:
-            if shutil.which("ffmpeg") is not None:
-                bt_wav = out_wav[:-4] + ".bt.wav" if out_wav.lower().endswith(".wav") else out_wav + ".bt.wav"
-                conv_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", out_wav,
-                    "-ar", "44100",
-                    "-ac", "2",
-                    "-sample_fmt", "s16",
-                    bt_wav
-                ]
-
-                subprocess.run(
-                    conv_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-
-                # 변환 성공/유효성 간단 체크
-                if os.path.exists(bt_wav) and os.path.getsize(bt_wav) > 44:
-                    try:
-                        _, sr2 = sf.read(bt_wav)
-                        print(f"[TTS] converted wav -> {bt_wav} (sr={sr2})")
-                    except Exception:
-                        print(f"[TTS] converted wav -> {bt_wav}")
-                    play_wav = bt_wav
-                else:
-                    print("[WARN] ffmpeg conversion failed or produced invalid file. Using raw wav.")
-            else:
-                print("[WARN] ffmpeg not found. Using raw wav (BT may sound weird).")
-        except Exception as e:
-            print(f"[WARN] conversion step failed: {e}. Using raw wav.")
-
-        # 4) 재생 (BT sink Description 매칭)
-        self._play_wav(play_wav)
-
-        return play_wav
-
+        return out_wav
