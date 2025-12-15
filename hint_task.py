@@ -55,7 +55,7 @@ ACTION_SPACE = ["forward", "left", "right", "stop", "goal"]
 # 프롬프트 템플릿 캐시용 전역 변수
 PROMPT_TEMPLATE: str | None = None
 CHATGPT_MODEL_NAME = "gpt-5"  
-LOCAL_QWEN_VLM_DIR = "/home/prcnsi/Downloads/nav_dataset_orin/nav_dataset/Qwen-VL-Series-Finetune/output/qwen_lora_merged"
+LOCAL_QWEN_VLM_DIR = "./qwen_lora_merged"
 
 def load_prompt_template(path: str = "prompt.txt") -> str:
     """
