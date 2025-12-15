@@ -242,6 +242,7 @@ class TTSProcessorPiper:
 
         self.model_path = model_path
         self.config_path = config_path
+        self.pulse_sink_name = pulse_sink_name
         self.piper_bin = piper_bin
         self.sample_rate = sample_rate
 
@@ -294,31 +295,17 @@ class TTSProcessorPiper:
                 return sink_name
 
         return None
-
-    def _play_wav(self, wav_path: str, prefer_sink_desc: str | None = None):
-        """
-        1) prefer_sink_desc가 있으면 해당 Description을 가진 sink를 찾아 paplay로 출력
-        2) 못 찾으면 paplay(기본 sink)
-        3) paplay가 없으면 aplay로 fallback
-        """
-        # 1) paplay 우선
+    
+    def _play_wav(self, wav_path: str):
         if shutil.which("paplay") is not None:
-            sink_name = None
-            if prefer_sink_desc:
-                sink_name = self._find_pulse_sink_by_description(prefer_sink_desc)
-                if sink_name:
-                    print(f"[AUDIO] Using Pulse sink: {sink_name} (desc contains '{prefer_sink_desc}')")
-                    subprocess.run(["paplay", "--device", sink_name, wav_path], check=False)
-                    return
-                else:
-                    print(f"[WARN] Target BT sink not found by desc='{prefer_sink_desc}'. Fallback to default sink.")
-
+            if self.pulse_sink_name:
+                print(f"[AUDIO] Using Pulse sink (forced): {self.pulse_sink_name}")
+                subprocess.run(["paplay", "--device", self.pulse_sink_name, wav_path], check=False)
+                return
             subprocess.run(["paplay", wav_path], check=False)
             return
-
-        # 2) paplay 없으면 aplay fallback (BT에서는 보통 실패)
-        print("[WARN] paplay not found. Falling back to aplay (may fail for Bluetooth).")
         subprocess.run(["aplay", "-q", wav_path], check=False)
+
     
     def _convert_wav_for_bt(self, in_wav: str, out_wav: str):
         # ffmpeg 필요 (없으면 Dockerfile에 ffmpeg 설치)
@@ -383,11 +370,12 @@ class TTSProcessorPiper:
                 conv_cmd = [
                     "ffmpeg", "-y",
                     "-i", out_wav,
-                    "-ar", "48000",      # BT(A2DP)에서 안정적인 편
-                    "-ac", "2",          # stereo로 맞춤
+                    "-ar", "44100",
+                    "-ac", "2",
                     "-sample_fmt", "s16",
                     bt_wav
                 ]
+
                 subprocess.run(
                     conv_cmd,
                     stdout=subprocess.DEVNULL,
