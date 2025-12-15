@@ -228,33 +228,44 @@ class STTProcessor:
 
 
 
-class TTSProcessorXTTS:
-    def __init__(self, reference_wav: str, device: str = "cuda"):
-        """
-        reference_wav: 너 목소리/원하는 톤의 wav (짧아도 됨)
-        device: "cuda" 권장 (Jetson/데스크탑 GPU). CPU면 "cpu"
-        """
-        from TTS.api import TTS  # coqui-tts
+class TTSProcessorPiper:
+    """
+    Piper 기반 로컬 TTS.
+    - text -> wav 생성 -> aplay로 재생
+    - 가장 통합 쉽고 의존성 적음
+    """
+    def __init__(
+        self,
+        model_path: str,
+        config_path: str | None = None,
+        piper_bin: str = "piper",
+        aplay_bin: str = "aplay",
+        sample_rate: int = 22050,
+    ):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Piper model not found: {model_path}")
+        if config_path is not None and (not os.path.exists(config_path)):
+            raise FileNotFoundError(f"Piper config not found: {config_path}")
 
-        if not os.path.exists(reference_wav):
-            raise FileNotFoundError(f"reference wav not found: {reference_wav}")
+        self.model_path = model_path
+        self.config_path = config_path
+        self.piper_bin = piper_bin
+        self.aplay_bin = aplay_bin
+        self.sample_rate = sample_rate
 
-        self.reference_wav = reference_wav
-        self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-
-    def speak(self, text: str, out_wav: str | None = None):
+    def speak(self, text: str, out_wav: str | None = None) -> str:
         if out_wav is None:
             fd, out_wav = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
 
-        # 핵심: speaker_wav로 레퍼런스 음성 넣기
-        self.tts.tts_to_file(
-            text=text,
-            speaker_wav=self.reference_wav,
-            file_path=out_wav,
-            language="ko",
-        )
+        # piper 실행: stdin으로 text 전달, wav 파일 생성
+        cmd = [self.piper_bin, "--model", self.model_path, "--output_file", out_wav]
+        if self.config_path is not None:
+            cmd += ["--config", self.config_path]
 
-        # 재생: 도커/리눅스면 aplay가 제일 단순하고 안정적
-        subprocess.run(["aplay", "-q", out_wav], check=False)
+        subprocess.run(cmd, input=text, text=True, check=True)
+
+        # 재생
+        subprocess.run([self.aplay_bin, "-q", out_wav], check=False)
         return out_wav
+
