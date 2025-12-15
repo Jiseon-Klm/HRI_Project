@@ -520,127 +520,6 @@ def load_local_qwen_vlm(model_dir: str):
     print("[INFO] Local VLM loaded.")
     return processor, model
 
-# def query_chatgpt_action(
-#     client: OpenAI,
-#     model_name: str,
-#     frame_bgr,
-#     gesture,
-#     spoken_text,
-#     past_action,        # <==== ADD (list)
-#     turn_satisfied,     # <==== ADD (string "true"/"false" or boolean)
-# ):
-#     """
-#     input:
-#       - frame_bgr, gesture, spoken_text, past_action(list), turn_satisfied("true"/"false")
-#     output:
-#       - next_action (str), reason (str)
-#     """
-#     t_total0 = time.perf_counter()
-
-#     if frame_bgr is None:
-#         print("[WARN] frame_bgr가 None → 안전하게 'stop' 반환")
-#         return "stop", "No camera frame."
-
-#     # --- encode image ---
-#     try:
-#         frame_bgr = np.ascontiguousarray(frame_bgr, dtype=np.uint8)
-#         ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-#         if not ok:
-#             raise RuntimeError("cv2.imencode failed")
-#         data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
-#     except Exception as e:
-#         print(f"[ERROR] 이미지 인코딩 실패 ({e}) → 'stop' 반환")
-#         return "stop", "JPEG encode failed."
-
-#     gesture_str = _normalize_gesture_for_prompt(gesture)
-#     spoken_text = (spoken_text or "").strip()
-
-#     # past_action 길이가 너무 길어지면 LLM이 헷갈리니 최근 N개만 권장
-#     past_action = past_action or []
-#     past_action_tail = past_action[-10:]  # <==== RECOMMENDED: 최근 10개만
-
-#     # turn_satisfied는 프롬프트 일관성을 위해 문자열 "true"/"false"로 통일 추천
-#     if isinstance(turn_satisfied, bool):
-#         turn_satisfied_str = "true" if turn_satisfied else "false"
-#     else:
-#         turn_satisfied_str = str(turn_satisfied).lower()
-#         if turn_satisfied_str not in ("true", "false"):
-#             turn_satisfied_str = "false"
-
-#     # <==== CHANGED: JSON array로만 출력 강제
-#     system_instruction = (
-#         "You are a navigation decision module for a mobile robot.\n"
-#         "You MUST follow the user's prompt instructions.\n"
-#         "Return ONLY a valid JSON array with exactly 2 strings:\n"
-#         '["<next_action>", "<reason>"]\n'
-#         "Rules:\n"
-#         "- <next_action> MUST be exactly one of: forward, left, right, stop, goal\n"
-#         "- <reason> is a short explanation (1-3 sentences)\n"
-#         "- Output ONLY the JSON array. No extra text, no markdown, no code block.\n"
-#     )
-
-#     template = load_prompt_template("prompt.txt")
-
-#     # <==== CHANGED: prompt 템플릿에 새 placeholder 추가 (prompt.txt에도 반드시 넣어야 함)
-#     prompt = (
-#         template
-#         .replace("{spoken_text}", spoken_text)
-#         .replace("{gesture_str}", gesture_str)
-#         .replace("{past_action}", json.dumps(past_action_tail, ensure_ascii=False))
-#         .replace("{turn_satisfied}", turn_satisfied_str)
-#     )
-
-#     try:
-#         t_llm0 = time.perf_counter()
-#         resp = client.responses.create(
-#             model=model_name,
-#             # temperature=0,  # <==== OPTIONAL: 결정 문제면 0 권장 (지원되면 켜세요)
-#             input=[
-#                 {
-#                     "role": "system",
-#                     "content": [{"type": "input_text", "text": system_instruction}],
-#                 },
-#                 {
-#                     "role": "user",
-#                     "content": [
-#                         {"type": "input_text", "text": prompt},
-#                         {"type": "input_image", "image_url": data_url},
-#                     ],
-#                 },
-#             ],
-#         )
-#         t_llm1 = time.perf_counter()
-#     except Exception as e:
-#         print(f"[ERROR] ChatGPT API 호출 실패: {e} → 'stop' 반환")
-#         return "stop", f"ChatGPT API error: {e}"
-
-#     full_text = (resp.output_text or "").strip()
-
-#     # <==== NEW: JSON 파싱 (파싱 없애는 게 아니라, '항상 JSON만' 나오게 해서 파싱을 단순화)
-#     next_action = "stop"
-#     reason = "Failed to parse model output."
-
-#     try:
-#         arr = json.loads(full_text)
-#         if isinstance(arr, list) and len(arr) == 2:
-#             cand_action = str(arr[0]).strip().lower()
-#             cand_reason = str(arr[1]).strip()
-#             if cand_action in ACTION_SPACE:
-#                 next_action = cand_action
-#                 reason = cand_reason
-#             else:
-#                 next_action = "stop"
-#                 reason = f"Invalid action token from model: {cand_action}"
-#         else:
-#             reason = f"Output is not a 2-element JSON array: {full_text}"
-#     except Exception as e:
-#         reason = f"JSON parse error: {e} | raw={full_text}"
-
-#     t_total1 = time.perf_counter()
-#     print(f"[TIME] total per-frame (encode+LLM+parse): {(t_total1 - t_total0):.3f} s")
-
-#     return next_action, reason
-
 def query_local_qwen_action(processor, model, pil_imgs, gesture, spoken_text):
     """
     pil_imgs: [PIL.Image, PIL.Image, ...] (오래된 -> 최신)
@@ -700,12 +579,15 @@ def query_local_qwen_action(processor, model, pil_imgs, gesture, spoken_text):
         pass
 
     try:
+        t_gen0 = time.perf_counter()  
         with torch.inference_mode():
             out = model.generate(
                 **inputs,
                 max_new_tokens=8,
                 do_sample=False,
             )
+    t_gen1 = time.perf_counter() 
+    print(f"[TIME] Qwen generate only: {(t_gen1 - t_gen0):.3f} s")  #
     except Exception as e:
         print("[ERROR] Local VLM generate error:", e)
         # 디버그용: prompt head를 같이 찍으면 2차 원인 파악 쉬움
