@@ -32,6 +32,18 @@ from config import (
 )
 # ================== STT (Speech-to-Text) ==================
 os.environ["COQUI_TOS_AGREED"] = "1"
+
+# === transformers export monkey patch ===
+import transformers
+try:
+    # 최신 transformers에서는 여기 위치에 존재함(네가 확인한 경로)
+    from transformers.generation.beam_search import BeamSearchScorer
+    if not hasattr(transformers, "BeamSearchScorer"):
+        transformers.BeamSearchScorer = BeamSearchScorer
+except Exception as e:
+    print(f"[WARN] Failed to patch BeamSearchScorer: {e}")
+
+
 class STTProcessor:
     """
     - 처음 생성될 때 `arecord -l` 결과에서
