@@ -27,7 +27,7 @@ import base64
 
 from openai import OpenAI
 
-from llm_stt_tts import STTProcessor
+from llm_stt_tts import STTProcessor, TTSProcessorXTTS
 from config import (
     CAMERA_DEVICE_ID,   # 지금은 안 써도 되지만 호환용으로 남겨둠
     GEMINI_API_KEY,
@@ -544,6 +544,7 @@ def main():
 
     # 2) STT 준비 (ReSpeaker 입력, 초기 한 번만 사용)
     stt = STTProcessor()
+    tts = TTSProcessorXTTS(reference_wav="./amongus-voice.wav", device="cpu")  # or "cpu"
 
     dummy_volume = DummyVolumeSignal()
 
@@ -632,6 +633,7 @@ def main():
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
 
     finally:
+        tts.speak("안녕하세요")
         cam_thread.stop()
         cam_thread.join()
         print("[INFO] 종료 완료")
