@@ -17,6 +17,8 @@ POLICY (high priority -> low priority):
 3) Prefer forward to approach until a turn is clearly enterable now. Avoid early turns to far openings.
 4) stop only if forward/left/right are all unsafe within ~2 seconds.
 5) goal only with strong, close visual evidence of the destination described in spoken_text.
+- “Transparent glass/acrylic is not passable; veto a move only if it blocks the near path within ~2 seconds.”
 
 OUTPUT:
 Return ONLY one action token (no punctuation, no extra text).
+
