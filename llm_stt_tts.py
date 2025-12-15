@@ -12,6 +12,7 @@ import numpy as np
 import soundfile as sf
 import shutil
 import torch
+import soundfile as sf
 
 from google import genai
 
@@ -261,6 +262,12 @@ class TTSProcessorPiper:
                 text=True,
                 check=True,
             )
+            # 디버깅용             
+            print(f"[TTS] using model={self.model_path}")
+            print(f"[TTS] using config={self.config_path}")
+            
+            data, sr = sf.read(out_wav)
+            print(f"[TTS] wav sr={sr}, shape={data.shape}")
         except Exception as e:
             print(f"[WARN] pactl list sinks failed: {e}")
             return None
