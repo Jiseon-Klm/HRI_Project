@@ -27,7 +27,7 @@ import base64
 
 from openai import OpenAI
 
-from llm_stt_tts import STTProcessor, TTSProcessorXTTS
+from llm_stt_tts import STTProcessor, TTSProcessorPiper
 from config import (
     CAMERA_DEVICE_ID,   # 지금은 안 써도 되지만 호환용으로 남겨둠
     GEMINI_API_KEY,
@@ -544,7 +544,10 @@ def main():
 
     # 2) STT 준비 (ReSpeaker 입력, 초기 한 번만 사용)
     stt = STTProcessor()
-    tts = TTSProcessorXTTS(reference_wav="./amongus-voice.wav", device="cpu")  # or "cpu"
+    tts = TTSProcessorPiper(
+        model_path="./piper_models/ko_KR-model.onnx",   # <== 네 모델 파일
+        config_path="./piper_models/ko_KR-model.onnx.json"  # <== 있으면 넣고, 없으면 None
+    )
 
     dummy_volume = DummyVolumeSignal()
 
