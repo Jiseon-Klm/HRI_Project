@@ -39,6 +39,8 @@ from config import (
     GEMINI_MODEL_NAME,
 )
 import warnings  # <- 새로 추가
+LOCAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LOCAL_DTYPE  = torch.float16 if torch.cuda.is_available() else torch.float32
 
 # protobuf deprecation warning 숨기기
 warnings.filterwarnings(
@@ -770,7 +772,7 @@ def main():
             t_stt0 = time.perf_counter() 
             spoken_text = stt.transcribe(audio_file=audio_path).strip()
             t_stt1 = time.perf_counter()
-            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0):.1f} ms")
+            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0):.1f} s")
             if not spoken_text:
                 print("[MAIN] STT 결과가 비어 있음, 다시 대기")
                 continue
@@ -822,10 +824,7 @@ def main():
             # 여기 if문으로 turn_satisfied 여부 검사하는 if문 넣어야함.
             i+=1
             #time.sleep(6.0)
-            past_action.append(next_action)
-            if turn_satisfied != "true":
-                if initial_gesture in past_action:
-                    turn_satisfied = "true"
+
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
