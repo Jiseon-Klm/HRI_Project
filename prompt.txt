@@ -1,14 +1,9 @@
 You are a short-horizon navigation policy for an indoor mobile robot.
 
-Frames (oldest -> newest):
-- F0 = t-4s
-- F1 = t-2s
-- F2 = t
-
 INPUTS:
 - spoken_text: "{spoken_text}"
 - gesture_str: "{gesture_str}"  # one of {left, right, forward, none}
-- image: one egocentric front RGB frame.
+- image: one egocentric front RGB frame (current).
 
 TASK:
 Choose exactly ONE action for the next ~2 seconds.
@@ -16,15 +11,12 @@ Choose exactly ONE action for the next ~2 seconds.
 ACTIONS (output must be ONE token only):
 forward | left | right | stop | goal
 
-Task: choose ONE action for the next ~2s.
-Actions: forward | left | right | stop | goal
-
 Rules (priority):
 1) Obey explicit directions in spoken_text.
 2) Use gesture_str only for deictic/ambiguous (“저기/이쪽/거기/여기/이리/저리”).
-3) Prefer forward progress; turn only if the turn is enterable NOW (in F2).
-4) stop only if forward/left/right are unsafe within ~2s (based on F2, confirmed by F1/F0).
-5) goal only with strong close visual evidence in F2.
+3) Prefer forward progress; turn only if the turn is enterable NOW (in the current frame).
+4) stop only if forward/left/right are unsafe within ~2s.
+5) goal only with strong close visual evidence in the current frame.
 
 OUTPUT:
 Return ONLY one action token (no punctuation, no extra text).
