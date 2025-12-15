@@ -24,7 +24,9 @@ import pyrealsense2 as rs
 import mediapipe as mp
 import numpy as np
 import base64
-
+import rclpy
+from std_msgs.msg import String
+from rclpy.node import Node
 from openai import OpenAI
 
 from llm_stt_tts import STTProcessor, TTSProcessorPiper
@@ -520,6 +522,12 @@ def main():
         return
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+    #ros
+    rclpy.init(args=None)
+    ros_node = rclpy.create_node('publish_node')
+    publisher_sign = ros_node.create_publisher(String, 'sign', 10)
+    print("*" * 10 +"ROS2 Node Ready" + "*" * 10)
+    
     # 1) 제스처 카메라 쓰레드 시작 (이미 열린 cap을 넘김)
     cam_thread = GestureCamera(cap=cap)
     cam_thread.start()
@@ -601,6 +609,10 @@ def main():
                 turn_satisfied=turn_satisfied,
             )
 
+            msg = String()
+            msg.data = next_action
+            publisher_sign.publish(msg)
+            
             print(f"[RESULT] instruction    : {spoken_text_initial}")
             print(f"[RESULT] gesture: {initial_gesture}")
             print(f"[RESULT] next_action: {next_action}")
