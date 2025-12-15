@@ -12,6 +12,7 @@ gesture_nav_agent.py
   action_space = ["forward", "left", "right", "stop", "goal"] 중
   next_action을 계속 업데이트해서 터미널에 출력.
 """
+
 import threading
 import time
 import subprocess
@@ -24,11 +25,7 @@ import mediapipe as mp
 import numpy as np
 import base64
 
-# from openai import OpenAI
-import torch
-from PIL import Image
-from transformers import AutoProcessor
-from transformers.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from openai import OpenAI
 
 from llm_stt_tts import STTProcessor, TTSProcessorPiper
 from config import (
@@ -37,8 +34,6 @@ from config import (
     GEMINI_MODEL_NAME,
 )
 import warnings  # <- 새로 추가
-LOCAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-LOCAL_DTYPE  = torch.float16 if torch.cuda.is_available() else torch.float32
 
 # protobuf deprecation warning 숨기기
 warnings.filterwarnings(
@@ -53,7 +48,6 @@ ACTION_SPACE = ["forward", "left", "right", "stop", "goal"]
 # 프롬프트 템플릿 캐시용 전역 변수
 PROMPT_TEMPLATE: str | None = None
 CHATGPT_MODEL_NAME = "gpt-5"  
-LOCAL_QWEN_VLM_DIR = "./qwen_lora_merged"
 
 def load_prompt_template(path: str = "prompt.txt") -> str:
     """
@@ -76,7 +70,7 @@ def load_prompt_template(path: str = "prompt.txt") -> str:
 
 
 # ==========================
-# 0) RealSense 카메라 열기
+# 0) RealSense 카메라 열기stt
 # ==========================
 class RealSenseColorCap:
     def __init__(self, width=640, height=480, fps=30, serial: str | None = None, timeout_ms=2000):
@@ -357,6 +351,8 @@ class GestureCamera(threading.Thread):
             result = self._mp_hands.process(frame_rgb)            
             if result.multi_hand_landmarks:
                 print("[DEBUG] hand detected")
+            else:
+                print("[DEBUG] no hand")
           
             new_gesture = None  # 기본값: 이번 프레임에서는 새 제스처 없음
 
@@ -376,8 +372,6 @@ class GestureCamera(threading.Thread):
         self.cap.release()
         self._mp_hands.close()
         print("[INFO] GestureCamera 쓰레드 종료")
-
-
 
 
 # ==========================
@@ -400,123 +394,109 @@ def _normalize_gesture_for_prompt(gesture: str | None) -> str:
         return "forward"
     return "none"
 
-def load_local_qwen_vlm(model_dir: str):
+
+def query_chatgpt_action(
+    client: OpenAI,
+    model_name: str,
+    frame_bgr,
+    gesture,
+    spoken_text,
+    past_action,        # <==== ADD (list)
+    turn_satisfied,     # <==== ADD (string "true"/"false" or boolean)
+):
     """
-    로컬 Qwen3-VL (LoRA merge 완료된 full model) 로드.
-    - 프로그램 시작 시 1번만 호출해야 함 (매 프레임 로드 금지)
+    input:
+      - frame_bgr, gesture, spoken_text, past_action(list), turn_satisfied("true"/"false")
+    output:
+      - next_action (str)
     """
-    print(f"[INFO] Loading local VLM from: {model_dir}")
-    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+    t_total0 = time.perf_counter()
 
-    # GPU 사용 시 device_map을 쓰면 큰 모델도 비교적 안전하게 올라가요.
-    if LOCAL_DEVICE.startswith("cuda"):
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            torch_dtype=LOCAL_DTYPE,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+    if frame_bgr is None:
+        print("[WARN] frame_bgr가 None → 안전하게 'stop' 반환")
+        return "stop"
 
-    else:
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            dtype=LOCAL_DTYPE,
-            device_map="cpu",
-            trust_remote_code=True,
-        )
-
-    model.eval()
-
-    # 속도 옵션(선택)
+    # --- encode image ---
     try:
-        torch.backends.cuda.matmul.allow_tf32 = True
-    except Exception:
-        pass
-
-    print("[INFO] Local VLM loaded.")
-    return processor, model
-
-def query_local_qwen_action_single(processor, model, pil_img, gesture, spoken_text):
-    """
-    pil_img: PIL.Image (현재 프레임 1장)
-    return: next_action (str)
-    """
-    if pil_img is None:
+        frame_bgr = np.ascontiguousarray(frame_bgr, dtype=np.uint8)
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok:
+            raise RuntimeError("cv2.imencode failed")
+        data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
+    except Exception as e:
+        print(f"[ERROR] 이미지 인코딩 실패 ({e}) → 'stop' 반환")
         return "stop"
 
     gesture_str = _normalize_gesture_for_prompt(gesture)
     spoken_text = (spoken_text or "").strip()
+
+    # past_action 길이가 너무 길어지면 LLM이 헷갈리니 최근 N개만 권장
+    past_action = past_action or []
+    past_action_tail = past_action[-10:]  # <==== RECOMMENDED: 최근 10개만
+
+    # turn_satisfied는 프롬프트 일관성을 위해 문자열 "true"/"false"로 통일 추천
+    if isinstance(turn_satisfied, bool):
+        turn_satisfied_str = "true" if turn_satisfied else "false"
+    else:
+        turn_satisfied_str = str(turn_satisfied).lower()
+        if turn_satisfied_str not in ("true", "false"):
+            turn_satisfied_str = "false"
+
+    # <==== CHANGED: JSON array로만 출력 강제
+    system_instruction = (
+        "You are a navigation decision module for a mobile robot.\n"
+        "Return ONLY ONE token for the next action.\n"
+        "The token MUST be exactly one of: forward, left, right, stop, goal\n"
+        "Output ONLY the token. No extra text, no punctuation, no JSON, no quotes.\n"
+    )
+
     template = load_prompt_template("prompt.txt")
 
-    image_token = processor.image_token  # 보통 "<|image_pad|>"
-    vision_start = "<|vision_start|>"
-    vision_end   = "<|vision_end|>"
-
-    # ✅ 이미지 1장만 넣음
-    image_block = (vision_start + image_token + vision_end) + "\n"
-
+    # <==== CHANGED: prompt 템플릿에 새 placeholder 추가 (prompt.txt에도 반드시 넣어야 함)
     prompt = (
-        image_block +
-        template.replace("{spoken_text}", spoken_text)
-                .replace("{gesture_str}", gesture_str)
+        template
+        .replace("{spoken_text}", spoken_text)
+        .replace("{gesture_str}", gesture_str)
+        .replace("{past_action}", json.dumps(past_action_tail, ensure_ascii=False))
+        .replace("{turn_satisfied}", turn_satisfied_str)
     )
 
-    system_instruction = (
-        "You are a short-horizon navigation policy for a mobile robot.\n"
-        "Output ONLY one token among: forward, left, right, stop, goal\n"
-    )
-
-    messages = [
-        {"role": "system", "content": system_instruction},
-        {"role": "user", "content": prompt},
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    t_total0 = time.perf_counter()
-    # ✅ images는 리스트로 1장 전달
-    t0 = time.perf_counter()
-    inputs = processor(text=[text], images=[pil_img], return_tensors="pt")
-    t1 = time.perf_counter()
-
-    if torch.cuda.is_available():
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-    # sanity check: 이미지 토큰이 실제로 들어갔는지
     try:
-        decoded_head = processor.decode(inputs["input_ids"][0][:300], skip_special_tokens=False)
-        if image_token not in decoded_head:
-            print("[FATAL] image token not found in tokenized prompt head!")
-            print("[DEBUG] decoded_head:", decoded_head)
-            return "stop"
-    except Exception:
-        pass
-
-    try:
-        t2 = time.perf_counter()
-        with torch.inference_mode():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=4,   # ✅ 액션 1토큰이면 충분 (속도 ↑)
-                do_sample=False,
-            )
-        t3 = time.perf_counter()
-        print(f"[TIME] processor: {(t1 - t0):.3f}s | generate: {(t3 - t2):.3f}s")
+        t_llm0 = time.perf_counter()
+        resp = client.responses.create(
+            model=model_name,
+            # temperature=0,  # <==== OPTIONAL: 결정 문제면 0 권장 (지원되면 켜세요)
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system_instruction}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url},
+                    ],
+                },
+            ],
+        )
+        t_llm1 = time.perf_counter()
     except Exception as e:
-        print("[ERROR] Local VLM generate error:", e)
+        print(f"[ERROR] ChatGPT API 호출 실패: {e} → 'stop' 반환")
         return "stop"
 
-    prompt_len = inputs["input_ids"].shape[1]
-    gen_ids = out[0][prompt_len:]
-    full_text = processor.decode(gen_ids, skip_special_tokens=True).strip()
+    full_text = (resp.output_text or "").strip()
 
-    cand = re.split(r"\s+", full_text)[0].strip().strip('"\'').strip("[](),.")
-    if cand not in ACTION_SPACE:
-        print(f"[WARN] invalid action output: raw='{full_text}' -> cand='{cand}'")
-        return "stop"
-    # ✅ (B) 총시간 측정 끝
-    t_total1 = time.perf_counter()
-    print(f"[TIME] QWEN end-to-end (prep+gpu+gen+decode+parse): {(t_total1 - t_total0):.3f}s")
-    return cand
+    # 방어적으로 첫 줄/첫 토큰만 사용 (모델이 실수로 줄바꿈 넣는 경우 대비)
+    first = full_text.splitlines()[0].strip()
+    token = first.split()[0].strip()  # 공백 포함 출력 대비
 
+    if token in ACTION_SPACE:
+        next_action = token
+    else:
+        next_action = "stop"
+
+    return next_action
 
 
 # ==========================
@@ -538,9 +518,7 @@ def main():
         print(e)
         print("[FATAL] RealSense 카메라를 찾을 수 없어 종료합니다.")
         return
-    # client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    processor, local_model = load_local_qwen_vlm(LOCAL_QWEN_VLM_DIR)
-
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
     # 1) 제스처 카메라 쓰레드 시작 (이미 열린 cap을 넘김)
     cam_thread = GestureCamera(cap=cap)
@@ -553,8 +531,6 @@ def main():
         config_path="/ros2_ws/ws/voices/ko/piper-kss-korean.onnx.json",
         piper_bin="piper",
     )
-
-
     dummy_volume = DummyVolumeSignal()
 
     # ==========================
@@ -576,7 +552,7 @@ def main():
             t_stt0 = time.perf_counter() 
             spoken_text = stt.transcribe(audio_file=audio_path).strip()
             t_stt1 = time.perf_counter()
-            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0):.1f} s")
+            print(f"[TIME] transcribe (STT)       : {(t_stt1 - t_stt0):.1f} ms")
             if not spoken_text:
                 print("[MAIN] STT 결과가 비어 있음, 다시 대기")
                 continue
@@ -597,34 +573,46 @@ def main():
         cam_thread.join()
         return
 
+    print("\n[INFO] 초기 instruction + 제스처 확보 완료.")
+    print("[INFO] 이후에는 마이크는 더 이상 사용하지 않고,")
+    print("       6초마다 카메라 RGB + (초기 제스처, 초기 instruction)을 기반으로")
+    print("       ChatGPT에게 다음 액션을 질의합니다.\n")
+
     # ==========================
-    # 3-2) 현재 프레임 1장으로 next_action 업데이트
+    # 3-2) 6초 주기로 카메라 뷰 기반 next_action 업데이트
     # ==========================
+    i=0
+    past_action = []          # <==== ADD: 처음엔 빈 리스트
+    turn_satisfied = "false"  # <==== ADD: 문자열로 통일 ("true"/"false")
     try:
         while True:
             frame_bgr = cam_thread.get_latest_frame()
-            if frame_bgr is None:
-                time.sleep(0.01)
-                continue
+            gesture_now = cam_thread.get_gesture()  # freeze 이후엔 항상 initial_gesture와 동일
+            cv2.imwrite(f"./Hallway1/frame_{i}.jpg", frame_bgr)
 
-            # BGR -> PIL(RGB)
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame_rgb)
-
-            next_action = query_local_qwen_action_single(
-                processor=processor,
-                model=local_model,
-                pil_img=pil_img,
+            # next_action과 전체 LLM 응답을 모두 받음
+            next_action = query_chatgpt_action(
+                client=client,
+                model_name=CHATGPT_MODEL_NAME,
+                frame_bgr=frame_bgr,
                 gesture=initial_gesture,
                 spoken_text=spoken_text_initial,
+                past_action=past_action,
+                turn_satisfied=turn_satisfied,
             )
 
-            print(f"[RESULT] instruction : {spoken_text_initial}")
-            print(f"[RESULT] gesture     : {initial_gesture}")
-            print(f"[RESULT] next_action  : {next_action}")
+            print(f"[RESULT] instruction    : {spoken_text_initial}")
+            print(f"[RESULT] gesture: {initial_gesture}")
+            print(f"[RESULT] next_action: {next_action}")
+            print(f"[STATE] past_action (tail): {past_action[-10:]}")
             print("--------------------------------------------------------")
-
-            time.sleep(0.3)  # 너무 빠른 루프 방지
+            # 여기 if문으로 turn_satisfied 여부 검사하는 if문 넣어야함.
+            i+=1
+            #time.sleep(6.0)
+            past_action.append(next_action)
+            if turn_satisfied != "true":
+                if initial_gesture in past_action:
+                    turn_satisfied = "true"
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
