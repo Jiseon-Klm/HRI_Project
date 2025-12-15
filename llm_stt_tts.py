@@ -10,6 +10,7 @@ from transformers import VitsModel, AutoTokenizer
 import sounddevice as sd               # (TTS에서만 사용)
 import numpy as np
 import soundfile as sf
+import shutil
 import torch
 
 from google import genai
@@ -242,6 +243,79 @@ class TTSProcessorPiper:
         self.config_path = config_path
         self.piper_bin = piper_bin
         self.sample_rate = sample_rate
+    def _find_pulse_sink_by_description(self, target_desc: str) -> str | None:
+        """
+        PulseAudio/PipeWire sink 중에서 Description(혹은 device.description)에
+        target_desc가 포함된 sink의 'Name'을 찾아 반환.
+        예: bluez_output.XX_XX_...a2dp-sink
+        """
+        if shutil.which("pactl") is None:
+            print("[WARN] pactl not found. Install pulseaudio-utils in Dockerfile.")
+            return None
+
+        try:
+            proc = subprocess.run(
+                ["pactl", "list", "sinks"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+        except Exception as e:
+            print(f"[WARN] pactl list sinks failed: {e}")
+            return None
+
+        text = proc.stdout
+        blocks = text.split("Sink #")
+        target = target_desc.lower()
+
+        for b in blocks:
+            # sink name 라인 찾기: "Name: xxx"
+            m_name = re.search(r"^\s*Name:\s*(.+)$", b, flags=re.MULTILINE)
+            if not m_name:
+                continue
+            sink_name = m_name.group(1).strip()
+
+            # description 후보들
+            desc_candidates = []
+            m_desc = re.search(r"^\s*Description:\s*(.+)$", b, flags=re.MULTILINE)
+            if m_desc:
+                desc_candidates.append(m_desc.group(1).strip())
+            # PipeWire에서는 properties 안에 device.description이 있는 경우도 많아요
+            m_devdesc = re.search(r"device\.description\s*=\s*\"(.+?)\"", b)
+            if m_devdesc:
+                desc_candidates.append(m_devdesc.group(1).strip())
+
+            joined = " | ".join(desc_candidates).lower()
+            if target in joined:
+                return sink_name
+
+        return None
+
+    def _play_wav(self, wav_path: str, prefer_sink_desc: str | None = None):
+        """
+        1) prefer_sink_desc가 있으면 해당 Description을 가진 sink를 찾아 paplay로 출력
+        2) 못 찾으면 paplay(기본 sink)
+        3) paplay가 없으면 aplay로 fallback
+        """
+        # 1) paplay 우선
+        if shutil.which("paplay") is not None:
+            sink_name = None
+            if prefer_sink_desc:
+                sink_name = self._find_pulse_sink_by_description(prefer_sink_desc)
+                if sink_name:
+                    print(f"[AUDIO] Using Pulse sink: {sink_name} (desc contains '{prefer_sink_desc}')")
+                    subprocess.run(["paplay", "--device", sink_name, wav_path], check=False)
+                    return
+                else:
+                    print(f"[WARN] Target BT sink not found by desc='{prefer_sink_desc}'. Fallback to default sink.")
+
+            subprocess.run(["paplay", wav_path], check=False)
+            return
+
+        # 2) paplay 없으면 aplay fallback (BT에서는 보통 실패)
+        print("[WARN] paplay not found. Falling back to aplay (may fail for Bluetooth).")
+        subprocess.run(["aplay", "-q", wav_path], check=False)
 
     def speak(self, text: str, out_wav: str | None = None):
         if out_wav is None:
@@ -264,5 +338,5 @@ class TTSProcessorPiper:
         )
 
         # 재생 (도커면 --device /dev/snd 필요)
-        subprocess.run(["aplay", "-q", out_wav], check=False)
+        self._play_wav(out_wav, prefer_sink_desc="Mi Portable BT Speaker 16W")
         return out_wav
