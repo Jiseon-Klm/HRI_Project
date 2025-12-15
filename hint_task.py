@@ -553,7 +553,7 @@ def main():
     # ==========================
     spoken_text_initial = None
     initial_gesture = None
-
+    tts.speak("무엇을 도와드릴까요?")
     try:
         while True:
             print("\n[MAIN] 초기 instruction 발화를 기다리는 중... (ReSpeaker로 말해줘)")
@@ -572,6 +572,7 @@ def main():
                 print("[MAIN] STT 결과가 비어 있음, 다시 대기")
                 continue
 
+            tts.speak("알겠어요")
             # 여기서 STT가 성공한 시점의 제스처를 freeze
             cam_thread.freeze_gesture_once()
             initial_gesture = cam_thread.get_gesture()
@@ -586,11 +587,6 @@ def main():
         cam_thread.stop()
         cam_thread.join()
         return
-
-    print("\n[INFO] 초기 instruction + 제스처 확보 완료.")
-    print("[INFO] 이후에는 마이크는 더 이상 사용하지 않고,")
-    print("       6초마다 카메라 RGB + (초기 제스처, 초기 instruction)을 기반으로")
-    print("       ChatGPT에게 다음 액션을 질의합니다.\n")
 
     # ==========================
     # 3-2) 6초 주기로 카메라 뷰 기반 next_action 업데이트
@@ -633,7 +629,6 @@ def main():
         print("\n[INFO] KeyboardInterrupt, 종료 중...")
 
     finally:
-        tts.speak("안녕하세요")
         cam_thread.stop()
         cam_thread.join()
         print("[INFO] 종료 완료")
