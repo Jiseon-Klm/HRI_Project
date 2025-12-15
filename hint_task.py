@@ -471,7 +471,7 @@ def query_local_qwen_action_single(processor, model, pil_img, gesture, spoken_te
         {"role": "user", "content": prompt},
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
+    t_total0 = time.perf_counter()
     # ✅ images는 리스트로 1장 전달
     t0 = time.perf_counter()
     inputs = processor(text=[text], images=[pil_img], return_tensors="pt")
@@ -512,6 +512,9 @@ def query_local_qwen_action_single(processor, model, pil_img, gesture, spoken_te
     if cand not in ACTION_SPACE:
         print(f"[WARN] invalid action output: raw='{full_text}' -> cand='{cand}'")
         return "stop"
+    # ✅ (B) 총시간 측정 끝
+    t_total1 = time.perf_counter()
+    print(f"[TIME] QWEN end-to-end (prep+gpu+gen+decode+parse): {(t_total1 - t_total0):.3f}s")
     return cand
 
 
