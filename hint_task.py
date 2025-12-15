@@ -359,8 +359,6 @@ class GestureCamera(threading.Thread):
             result = self._mp_hands.process(frame_rgb)            
             if result.multi_hand_landmarks:
                 print("[DEBUG] hand detected")
-            else:
-                print("[DEBUG] no hand")
           
             new_gesture = None  # 기본값: 이번 프레임에서는 새 제스처 없음
 
@@ -522,64 +520,6 @@ def load_local_qwen_vlm(model_dir: str):
     print("[INFO] Local VLM loaded.")
     return processor, model
 
-# 디버깅용
-def debug_dump_qwen_vl_tokens(processor):
-    print("\n====== [DEBUG] Qwen-VL processor token dump ======")
-
-    # 1) processor가 제공하는 이미지 토큰 속성들(있을 수도/없을 수도)
-    for name in ["image_token", "IMAGE_TOKEN", "vision_token", "VISION_TOKEN", "img_token", "IMG_TOKEN"]:
-        if hasattr(processor, name):
-            print(f"[DEBUG] processor.{name} =", repr(getattr(processor, name)))
-
-    # 2) tokenizer의 special tokens / 추가 special tokens 확인
-    tok = getattr(processor, "tokenizer", None)
-    if tok is None:
-        print("[DEBUG] processor.tokenizer is None (unexpected)")
-        return
-
-    print("[DEBUG] tokenizer.name_or_path =", getattr(tok, "name_or_path", None))
-    print("[DEBUG] tokenizer.special_tokens_map =", tok.special_tokens_map)
-    print("[DEBUG] tokenizer.additional_special_tokens =", tok.additional_special_tokens)
-
-    # 3) special token 문자열 -> token id 매핑(가능한 것들만)
-    cands = []
-    # additional_special_tokens가 있으면 우선 후보로
-    if tok.additional_special_tokens:
-        cands += list(tok.additional_special_tokens)
-    # 흔히 쓰이는 후보들도 추가
-    cands += ["<image>", "<img>", "<vision>", "<|image_pad|>", "<|image|>", "<|vision_start|>", "<|vision_end|>"]
-
-    # 중복 제거하면서 id 확인
-    seen = set()
-    for s in cands:
-        if s in seen:
-            continue
-        seen.add(s)
-        try:
-            tid = tok.convert_tokens_to_ids(s)
-            # convert_tokens_to_ids가 모르면 보통 unk id를 줘서, 그것도 같이 출력
-            print(f"[DEBUG] token '{s}' -> id {tid}")
-        except Exception as e:
-            print(f"[DEBUG] token '{s}' -> (error) {e}")
-
-    # 4) apply_chat_template 결과에 실제로 이미지 토큰이 들어가는지 sanity 체크
-    try:
-        msgs = [
-            {"role": "system", "content": "test"},
-            {"role": "user", "content": "IMAGE_HERE"},
-        ]
-        txt = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        print("[DEBUG] apply_chat_template(text) head:", repr(txt[:400]))
-    except Exception as e:
-        print("[DEBUG] apply_chat_template failed:", e)
-
-    print("====== [DEBUG] end ======\n")
-
-
-# load_local_qwen_vlm() 호출 뒤에 딱 1번 실행
-processor, local_model = load_local_qwen_vlm(LOCAL_QWEN_VLM_DIR)
-debug_dump_qwen_vl_tokens(processor)
-
 # def query_chatgpt_action(
 #     client: OpenAI,
 #     model_name: str,
@@ -703,42 +643,61 @@ debug_dump_qwen_vl_tokens(processor)
 
 def query_local_qwen_action(processor, model, pil_imgs, gesture, spoken_text):
     """
-    pil_imgs: [PIL.Image, PIL.Image, PIL.Image] (오래된 -> 최신 순)
+    pil_imgs: [PIL.Image, PIL.Image, ...] (오래된 -> 최신)
     return: next_action (str)
     """
-    if not pil_imgs or len(pil_imgs) == 0:
+    if not pil_imgs:
         return "stop"
 
     gesture_str = _normalize_gesture_for_prompt(gesture)
     spoken_text = (spoken_text or "").strip()
-
     template = load_prompt_template("prompt.txt")
 
-    # ✅ 학습 포맷 최대한 맞추기: <image> 토큰을 K번 붙이고 줄바꿈
+    # ✅ "정답" 이미지 토큰 (너 로그에서 확정: '<|image_pad|>')
+    image_token = processor.image_token  # '<|image_pad|>'
+
+    # ✅ Qwen 계열에서 흔히 쓰이는 비전 래퍼 토큰도 tokenizer에 존재함 (너 로그에서 확인됨)
+    vision_start = "<|vision_start|>"
+    vision_end   = "<|vision_end|>"
+
+    # ✅ 이미지 K장 = (vision_start + image_pad + vision_end)를 K번 반복
     k = len(pil_imgs)
-    prompt = (("<image>" * k) + "\n" +
-              template.replace("{spoken_text}", spoken_text)
-                      .replace("{gesture_str}", gesture_str))
+    image_block = ((vision_start + image_token + vision_end) + "\n") * k
+
+    prompt = (
+        image_block +
+        template.replace("{spoken_text}", spoken_text)
+                .replace("{gesture_str}", gesture_str)
+    )
 
     system_instruction = (
         "You are a short-horizon navigation policy for a mobile robot.\n"
         "Output ONLY one token among: forward, left, right, stop, goal\n"
     )
 
+    # ✅ apply_chat_template는 그대로 사용
     messages = [
         {"role": "system", "content": system_instruction},
         {"role": "user", "content": prompt},
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    inputs = processor(
-        text=[text],
-        images=pil_imgs,              # ✅ 3장 그대로 넣기
-        return_tensors="pt",
-    )
+    # ✅ 여기서부터 processor가 text와 images를 정렬해야 함
+    inputs = processor(text=[text], images=pil_imgs, return_tensors="pt")
 
     if torch.cuda.is_available():
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+    # --- (강추) 이미지 토큰 sanity check: tokens=0 재발 방지 ---
+    # input_ids를 decode해서 vision/image 토큰이 실제로 들어갔는지 확인
+    try:
+        decoded_head = processor.decode(inputs["input_ids"][0][:300], skip_special_tokens=False)
+        if "<|image_pad|>" not in decoded_head:
+            print("[FATAL] image token not found in tokenized prompt head!")
+            print("[DEBUG] decoded_head:", decoded_head)
+            return "stop"
+    except Exception:
+        pass
 
     try:
         with torch.inference_mode():
@@ -749,19 +708,23 @@ def query_local_qwen_action(processor, model, pil_imgs, gesture, spoken_text):
             )
     except Exception as e:
         print("[ERROR] Local VLM generate error:", e)
+        # 디버그용: prompt head를 같이 찍으면 2차 원인 파악 쉬움
+        try:
+            print("[DEBUG] decoded prompt head:", processor.decode(inputs["input_ids"][0][:300], skip_special_tokens=False))
+        except Exception:
+            pass
         return "stop"
 
     prompt_len = inputs["input_ids"].shape[1]
     gen_ids = out[0][prompt_len:]
     full_text = processor.decode(gen_ids, skip_special_tokens=True).strip()
 
-    cand = re.split(r"\s+", full_text)[0]
-    cand = cand.strip().strip('"\'').strip("[](),.")
-
+    cand = re.split(r"\s+", full_text)[0].strip().strip('"\'').strip("[](),.")
     if cand not in ACTION_SPACE:
         print(f"[WARN] invalid action output: raw='{full_text}' -> cand='{cand}'")
         return "stop"
     return cand
+
 
 # ==========================
 # 3) STT + 메인 루프 (초기 한 번만 STT / 제스처 freeze)
