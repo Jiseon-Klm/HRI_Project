@@ -262,12 +262,7 @@ class TTSProcessorPiper:
                 text=True,
                 check=True,
             )
-            # 디버깅용             
-            print(f"[TTS] using model={self.model_path}")
-            print(f"[TTS] using config={self.config_path}")
-            
-            data, sr = sf.read(out_wav)
-            print(f"[TTS] wav sr={sr}, shape={data.shape}")
+
         except Exception as e:
             print(f"[WARN] pactl list sinks failed: {e}")
             return None
@@ -344,6 +339,15 @@ class TTSProcessorPiper:
             check=True,
         )
 
-        # 재생 (도커면 --device /dev/snd 필요)
+
+        # ✅ 여기부터 디버깅 출력 넣기 (out_wav가 존재하는 스코프)
+        print(f"[TTS] using model={self.model_path}")
+        print(f"[TTS] using config={self.config_path}")
+        try:
+            data, sr = sf.read(out_wav)
+            print(f"[TTS] wav sr={sr}, shape={getattr(data, 'shape', None)}")
+        except Exception as e:
+            print(f"[WARN] failed to read generated wav: {e}")
+    
         self._play_wav(out_wav, prefer_sink_desc="Mi Portable BT Speaker 16W")
         return out_wav
