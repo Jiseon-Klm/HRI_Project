@@ -234,7 +234,8 @@ class TTSProcessorPiper:
                  model_path: str,
                  config_path: str,
                  piper_bin: str = "piper",
-                 sample_rate: int = 22050):
+                 sample_rate: int = 22050,
+                 pulse_sink_name: str | None = None):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"piper model not found: {model_path}")
         if not os.path.exists(config_path):
@@ -242,9 +243,16 @@ class TTSProcessorPiper:
 
         self.model_path = model_path
         self.config_path = config_path
-        self.pulse_sink_name = pulse_sink_name
         self.piper_bin = piper_bin
         self.sample_rate = sample_rate
+
+        # ✅ BT sink를 description으로 찾지 말고 이름으로 강제
+        # 환경변수로도 override 가능하게
+        self.pulse_sink_name = (
+            os.environ.get("PULSE_SINK")
+            or pulse_sink_name
+            or "bluez_output.08_EB_ED_6E_45_1A.1"
+        )
 
     def _find_pulse_sink_by_description(self, target_desc: str) -> str | None:
         """
@@ -297,14 +305,46 @@ class TTSProcessorPiper:
         return None
     
     def _play_wav(self, wav_path: str):
-        if shutil.which("paplay") is not None:
-            if self.pulse_sink_name:
-                print(f"[AUDIO] Using Pulse sink (forced): {self.pulse_sink_name}")
-                subprocess.run(["paplay", "--device", self.pulse_sink_name, wav_path], check=False)
-                return
-            subprocess.run(["paplay", wav_path], check=False)
-            return
-        subprocess.run(["aplay", "-q", wav_path], check=False)
+        """
+        ✅ 무조건 지정 sink로 출력한다.
+        - 실패하면 즉시 원인을 드러내기 위해 에러를 출력한다.
+        """
+        if shutil.which("paplay") is None:
+            raise RuntimeError("paplay not found (install pulseaudio-utils).")
+
+        # sink 존재 여부 체크 (pactl이 안 되면 Pulse 서버 연결 자체가 깨진 것)
+        if shutil.which("pactl") is None:
+            raise RuntimeError("pactl not found (install pulseaudio-utils).")
+
+        try:
+            proc = subprocess.run(
+                ["pactl", "list", "short", "sinks"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+        except Exception as e:
+            raise RuntimeError(f"pactl failed (Pulse/PipeWire not reachable from container): {e}")
+
+        if self.pulse_sink_name not in proc.stdout:
+            raise RuntimeError(
+                f"Target sink '{self.pulse_sink_name}' not visible.\n"
+                f"pactl list short sinks:\n{proc.stdout}"
+            )
+
+        # ✅ 여기서부터 실제 재생
+        r = subprocess.run(
+            ["paplay", "--device", self.pulse_sink_name, wav_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"paplay failed (sink={self.pulse_sink_name}). Output:\n{r.stdout}"
+            )
+
 
     
     def _convert_wav_for_bt(self, in_wav: str, out_wav: str):
@@ -316,7 +356,7 @@ class TTSProcessorPiper:
         cmd = [
             "ffmpeg", "-y",
             "-i", in_wav,
-            "-ar", "48000",      # 48kHz
+            "-ar", "44100",      # 48kHz
             "-ac", "2",          # stereo
             "-sample_fmt", "s16",
             out_wav
@@ -399,6 +439,7 @@ class TTSProcessorPiper:
             print(f"[WARN] conversion step failed: {e}. Using raw wav.")
 
         # 4) 재생 (BT sink Description 매칭)
-        self._play_wav(play_wav, prefer_sink_desc="Mi Portable BT Speaker 16W")
+        self._play_wav(play_wav)
+
         return play_wav
 
