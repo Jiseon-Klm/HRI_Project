@@ -229,43 +229,32 @@ class STTProcessor:
 
 
 class TTSProcessorPiper:
-    """
-    Piper 기반 로컬 TTS.
-    - text -> wav 생성 -> aplay로 재생
-    - 가장 통합 쉽고 의존성 적음
-    """
-    def __init__(
-        self,
-        model_path: str,
-        config_path: str | None = None,
-        piper_bin: str = "piper",
-        aplay_bin: str = "aplay",
-        sample_rate: int = 22050,
-    ):
-        if not os.path.exists(model_path):
+    def __init__(self, piper_bin="piper", model_path="", config_path=""):
+        if not model_path or not os.path.exists(model_path):
             raise FileNotFoundError(f"Piper model not found: {model_path}")
-        if config_path is not None and (not os.path.exists(config_path)):
+        if not config_path or not os.path.exists(config_path):
             raise FileNotFoundError(f"Piper config not found: {config_path}")
 
+        self.piper_bin = piper_bin
         self.model_path = model_path
         self.config_path = config_path
-        self.piper_bin = piper_bin
-        self.aplay_bin = aplay_bin
-        self.sample_rate = sample_rate
 
-    def speak(self, text: str, out_wav: str | None = None) -> str:
+    def speak(self, text: str, out_wav: str | None = None):
         if out_wav is None:
             fd, out_wav = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
 
-        # piper 실행: stdin으로 text 전달, wav 파일 생성
-        cmd = [self.piper_bin, "--model", self.model_path, "--output_file", out_wav]
-        if self.config_path is not None:
-            cmd += ["--config", self.config_path]
-
+        # Piper는 stdin으로 텍스트를 받는 방식이 제일 깔끔함
+        cmd = [
+            self.piper_bin,
+            "--model", self.model_path,
+            "--config", self.config_path,
+            "--output_file", out_wav,
+        ]
         subprocess.run(cmd, input=text, text=True, check=True)
 
-        # 재생
-        subprocess.run([self.aplay_bin, "-q", out_wav], check=False)
+        # 재생(도커/리눅스 기준)
+        subprocess.run(["aplay", "-q", out_wav], check=False)
         return out_wav
+
 
